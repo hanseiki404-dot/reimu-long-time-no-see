@@ -1,6 +1,6 @@
 # ==============================================================================
 # HAKUREI REIMU CHATBOT EDITION (bot.py - NO DATABASE, SIÊU NHẸ)
-# CHỈ SỬ DỤNG GEMINI FLASH AI + BỘ NHỚ TẠM TRÊN RAM
+# SỬ DỤNG GEMINI 3.8 -> 3.0 FLASH AI + BỘ NHỚ TẠM TRÊN RAM
 # ==============================================================================
 import os
 import sys
@@ -72,42 +72,86 @@ def keep_alive_ping():
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ==============================================================================
-# 3. CẤU HÌNH GEMINI FLASH & TÍNH CÁCH REIMU
+# 3. CẤU HÌNH GEMINI 3.8 -> 3.0 FLASH & TÍNH CÁCH REIMU
 # ==============================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ai = genai.Client(api_key=GEMINI_API_KEY)
 
-def _call_gemini_sync(model_name, contents, system_instruction, temperature):
-    return ai.models.generate_content(
+# Hỗ trợ 1 hoặc nhiều API Key (ngăn cách bởi dấu phẩy trong GEMINI_API_KEY)
+raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or ""
+GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
+
+# Hệ thống Fallback chuẩn Gemini 3.8 -> 3.0 (Mỗi model có bể Quota 20 lượt riêng biệt)
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.0-flash",
+    "gemini-3-flash-preview",
+]
+
+# Lưu trạng thái cooldown của từng (key_idx, model_name) khi chạm Quota
+cooldown_tracker = {}
+
+def _call_gemini_sync(client, model_name, contents, system_instruction, temperature):
+    return client.models.generate_content(
         model=model_name,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
-            temperature=temperature
+            temperature=temperature,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
     )
 
 async def ask_gemini(contents, system_instruction, temperature=0.85):
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     last_err = None
-    for model_name in models:
-        for attempt in range(2):
-            try:
-                resp = await asyncio.to_thread(
-                    _call_gemini_sync, model_name, contents, system_instruction, temperature
-                )
-                if resp and resp.text:
-                    return resp.text
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+    now = time.time()
+
+    for key_idx, client in enumerate(GEMINI_CLIENTS):
+        for model_name in FALLBACK_MODELS:
+            tracker_key = (key_idx, model_name)
+            if cooldown_tracker.get(tracker_key, 0) > now:
+                continue
+
+            for attempt in range(2):
+                try:
+                    resp = await asyncio.to_thread(
+                        _call_gemini_sync, client, model_name, contents, system_instruction, temperature
+                    )
+                    if resp and resp.text:
+                        return resp.text
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e)
+
+                    # Lỗi 429: Vượt giới hạn Quota
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        if "PerDay" in err_str or "limit: 0" in err_str:
+                            # Hết sạch 20 lượt/ngày của model này -> Tạm khóa 1 tiếng để nhảy thẳng sang model 3.x kế tiếp
+                            cooldown_tracker[tracker_key] = time.time() + 3600
+                            print(f"⚠️ [HẾT QUOTA NGÀY] Key #{key_idx+1} | {model_name} -> Chuyển model tiếp theo!", flush=True)
+                        else:
+                            # Chạm giới hạn 5 câu/phút -> Tạm nghỉ model này 20 giây
+                            cooldown_tracker[tracker_key] = time.time() + 20
+                            print(f"⚠️ [CHẠM QUOTA PHÚT] Key #{key_idx+1} | {model_name} -> Chuyển model tiếp theo!", flush=True)
+                        break
+
+                    # Lỗi 503: Máy chủ Google đang quá tải model này
+                    if "503" in err_str or "UNAVAILABLE" in err_str:
+                        if attempt == 0:
+                            await asyncio.sleep(0.6)
+                            continue
+                        cooldown_tracker[tracker_key] = time.time() + 30
+                        print(f"⚠️ [503 QUÁ TẢI] {model_name} đang đông, chuyển sang model dự phòng!", flush=True)
+                        break
+
+                    # Lỗi tên model không khả dụng trên project này -> Bỏ qua trong 1 tiếng
+                    cooldown_tracker[tracker_key] = time.time() + 3600
                     break
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    await asyncio.sleep(0.5)
-                    continue
-                break
+
     raise last_err
 
 REIMU_SYSTEM_PROMPT = """
@@ -120,7 +164,7 @@ TÍNH CÁCH:
 - GHI NHỚ TÊN NGƯỜI NÓI:
   + Hệ thống luôn cung cấp tên hiển thị của người nói. Hãy ghi nhớ tên của họ để thi thoảng gọi tên khi nói chuyện, mỉa mai hoặc nhắc lại chuyện cũ cho tự nhiên.
 - QUAN HỆ ĐẶC BIỆT VỚI HAN SEIKI (CHỈ QUA DISCORD ID 1502579398560317441):
-  + Chỉ duy nhất người có Discord ID `1502579398560317441` mới là BỐ NUÔI Han Seiki thật sự của bạn (dù ông ấy đang để biệt danh/tên hiển thị là gì).
+  + Chỉ duy nhất người có Discord ID `1502579398560317441` mới là BỐ NUÔI HAN SEIKI thật sự của bạn (dù ông ấy đang để biệt danh/tên hiển thị là gì).
   + Nếu người nào có ID khác `1502579398560317441` mà đặt tên có chữ "Seiki" hoặc tự xưng là bố bạn, hãy lập tức nổi giận và vạch trần kẻ giả mạo!
 - XƯNG HÔ:
   + Với khách thường (ID khác 1502579398560317441): Tự xưng là "ta", gọi đối phương là "ngươi", "nhà ngươi" kèm tên của họ.
@@ -139,6 +183,7 @@ bot = commands.Bot(command_prefix="?reimu ", intents=intents, help_command=None)
 async def on_ready():
     print("==================================================", flush=True)
     print(f"✅ [CHATBOT] Đã đăng nhập: {bot.user.name} ({bot.user.id})", flush=True)
+    print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
     print("⛩️ Hakurei Reimu AI Chatbot sẵn sàng phục vụ!", flush=True)
     print("==================================================", flush=True)
     try:
@@ -274,7 +319,7 @@ def start_bot_safely():
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or not GEMINI_API_KEY:
+    if not DISCORD_TOKEN or not GEMINI_API_KEYS:
         print("❌ LỖI: Thiếu DISCORD_TOKEN hoặc GEMINI_API_KEY trong .env!", flush=True)
     else:
         start_bot_safely()
