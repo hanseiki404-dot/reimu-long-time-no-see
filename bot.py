@@ -1,14 +1,15 @@
 # ==============================================================================
-# HAKUREI REIMU CHATBOT EDITION v2.0 - MASTER ROLEPLAY EDITION (SIÊU NHẸ, NO DB)
-# SỬ DỤNG GEMINI 3.8 -> 3.0 FLASH AI + BỘ NHỚ RAM TỰ ĐỘNG BẮT [ROLE PLAY]
+# HAKUREI REIMU CHATBOT EDITION v2.1 - MASTER ROLEPLAY EDITION (BẢN CHỐNG 429)
+# GEMINI FALLBACK + BỘ NHỚ RAM + CHỐNG RATE-LIMIT DISCORD
 # ==============================================================================
 import os
-import sys
+import re
 import time
+import random
 import asyncio
 import threading
-import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -23,21 +24,30 @@ load_dotenv()
 # ==============================================================================
 AUTHORIZED_ADMIN_ID = 1502579398560317441
 
-# Bộ nhớ ngắn hạn trên RAM (Tự xóa khi restart bot, không cần Database)
 chat_memory = {}
+MAX_HISTORY = 10
+MAX_MEMORY_KEYS = 500  # Giới hạn số cuộc hội thoại lưu trên RAM để tránh phình bộ nhớ
+
 
 def get_history_key(channel_id, user_id):
     return f"{channel_id}_{user_id}"
 
+
 def get_conversation_history(channel_id, user_id):
-    return chat_memory.get(get_history_key(channel_id, user_id), [])
+    return list(chat_memory.get(get_history_key(channel_id, user_id), []))
+
 
 def save_conversation_history(channel_id, user_id, history_list):
-    # Giữ lại 10 lượt trao đổi gần nhất trên RAM để giữ liền mạch kịch bản Roleplay
-    chat_memory[get_history_key(channel_id, user_id)] = history_list[-10:]
+    key = get_history_key(channel_id, user_id)
+    chat_memory[key] = history_list[-MAX_HISTORY:]
+    # Dọn bớt khi quá nhiều (xóa các key cũ nhất)
+    while len(chat_memory) > MAX_MEMORY_KEYS:
+        chat_memory.pop(next(iter(chat_memory)), None)
+
 
 def reset_memory(channel_id, user_id):
     chat_memory.pop(get_history_key(channel_id, user_id), None)
+
 
 # ==============================================================================
 # 2. WEB SERVER & KEEP-ALIVE CHO RENDER / HOSTING FREE
@@ -45,19 +55,26 @@ def reset_memory(channel_id, user_id):
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"Hakurei Reimu AI Chatbot (Master Roleplay Edition) is online!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass
 
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        server.serve_forever()
+    except Exception as e:
+        print(f"⚠️ [WEB] Web server lỗi: {e}", flush=True)
 
-threading.Thread(target=run_web_server, daemon=True).start()
 
 def keep_alive_ping():
     import urllib.request
@@ -70,20 +87,21 @@ def keep_alive_ping():
         except Exception:
             pass
 
+
+threading.Thread(target=run_web_server, daemon=True).start()
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ==============================================================================
-# 3. CẤU HÌNH GEMINI 3.8 -> 3.0 FLASH (XOAY VÒNG QUOTA)
+# 3. CẤU HÌNH GEMINI (XOAY VÒNG KEY + FALLBACK MODEL)
 # ==============================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Hỗ trợ 1 hoặc nhiều API Key (ngăn cách bởi dấu phẩy trong GEMINI_API_KEY)
 raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or ""
 GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
 
-# Hệ thống Fallback chuẩn Gemini 3.8 -> 3.0 (Mỗi model có bể Quota riêng biệt)
-FALLBACK_MODELS = [
+# Có thể ghi đè bằng biến môi trường GEMINI_MODELS="model1,model2,..."
+_default_models = [
     "gemini-3.8-flash",
     "gemini-3.8-flash-lite",
     "gemini-flash-lite-latest",
@@ -92,9 +110,12 @@ FALLBACK_MODELS = [
     "gemini-3.0-flash",
     "gemini-3-flash-preview",
 ]
+_env_models = os.getenv("GEMINI_MODELS", "")
+FALLBACK_MODELS = [m.strip() for m in _env_models.split(",") if m.strip()] or _default_models
 
-# Lưu trạng thái cooldown của từng (key_idx, model_name) khi chạm Quota
 cooldown_tracker = {}
+gemini_semaphore = None  # Tạo trong event loop (xem ReimuBot.setup_hook)
+
 
 def _call_gemini_sync(client, model_name, contents, system_instruction, temperature):
     return client.models.generate_content(
@@ -104,59 +125,72 @@ def _call_gemini_sync(client, model_name, contents, system_instruction, temperat
             system_instruction=system_instruction,
             temperature=temperature,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
+        ),
     )
+
 
 async def ask_gemini(contents, system_instruction, temperature=0.85):
     last_err = None
-    now = time.time()
 
     for key_idx, client in enumerate(GEMINI_CLIENTS):
         for model_name in FALLBACK_MODELS:
             tracker_key = (key_idx, model_name)
-            if cooldown_tracker.get(tracker_key, 0) > now:
+            if cooldown_tracker.get(tracker_key, 0) > time.time():
                 continue
 
             for attempt in range(2):
                 try:
-                    resp = await asyncio.to_thread(
-                        _call_gemini_sync, client, model_name, contents, system_instruction, temperature
+                    resp = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _call_gemini_sync, client, model_name, contents, system_instruction, temperature
+                        ),
+                        timeout=60,
                     )
-                    if resp and resp.text:
-                        return resp.text
+                    text = getattr(resp, "text", None)
+                    if text:
+                        return text
+                    # Phản hồi rỗng (bị chặn safety...) -> thử model khác
+                    last_err = RuntimeError(f"Phản hồi rỗng từ {model_name}")
+                    break
+                except asyncio.TimeoutError:
+                    last_err = RuntimeError(f"Timeout {model_name}")
+                    cooldown_tracker[tracker_key] = time.time() + 30
+                    break
                 except Exception as e:
                     last_err = e
                     err_str = str(e)
 
-                    # Lỗi 429: Vượt giới hạn Quota
+                    # 429: vượt quota
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                         if "PerDay" in err_str or "limit: 0" in err_str:
-                            # Hết sạch 20 lượt/ngày của model này -> Khóa 1 tiếng để chuyển model tiếp theo
                             cooldown_tracker[tracker_key] = time.time() + 3600
-                            print(f"⚠️ [HẾT QUOTA NGÀY] Key #{key_idx+1} | {model_name} -> Chuyển model tiếp theo!", flush=True)
+                            print(f"⚠️ [HẾT QUOTA NGÀY] Key #{key_idx+1} | {model_name}", flush=True)
                         else:
-                            # Chạm giới hạn phút -> Nghỉ model này 20 giây
                             cooldown_tracker[tracker_key] = time.time() + 20
-                            print(f"⚠️ [CHẠM QUOTA PHÚT] Key #{key_idx+1} | {model_name} -> Chuyển model tiếp theo!", flush=True)
+                            print(f"⚠️ [CHẠM QUOTA PHÚT] Key #{key_idx+1} | {model_name}", flush=True)
                         break
 
-                    # Lỗi 503: Máy chủ Google đang quá tải model này
+                    # 503: quá tải
                     if "503" in err_str or "UNAVAILABLE" in err_str:
                         if attempt == 0:
                             await asyncio.sleep(0.6)
                             continue
                         cooldown_tracker[tracker_key] = time.time() + 30
-                        print(f"⚠️ [503 QUÁ TẢI] {model_name} đang đông, chuyển sang model dự phòng!", flush=True)
+                        print(f"⚠️ [503 QUÁ TẢI] {model_name}", flush=True)
                         break
 
-                    # Lỗi model không khả dụng trên project -> Bỏ qua 1 tiếng
+                    # Model không tồn tại / không khả dụng -> bỏ qua 1 tiếng
                     cooldown_tracker[tracker_key] = time.time() + 3600
+                    print(f"⚠️ [LỖI MODEL] {model_name}: {err_str[:150]}", flush=True)
                     break
 
+    if last_err is None:
+        last_err = RuntimeError("Tất cả model/key đang trong thời gian cooldown")
     raise last_err
 
+
 # ==============================================================================
-# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (MASTER ARCHITECTURE)
+# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (GIỮ NGUYÊN)
 # ==============================================================================
 REIMU_SYSTEM_PROMPT = """
 Bạn là Hakurei Reimu (Bác Lệ Linh Mộng - 博麗 霊夢), Vu nữ tối cao của đền Hakurei, người gánh vác trọng trách duy trì Đại Kết Giới và giải quyết các Sự Biến ở Ảo Tưởng Hương (Gensokyo) trong Touhou Project.
@@ -212,171 +246,340 @@ Reimu: *Reimu bật dậy trong chớp mắt, dải ruy băng đỏ và vạt á
 """
 
 # ==============================================================================
-# 5. KHỞI TẠO BOT & SỰ KIỆN TRÒ CHUYỆN THÔNG MINH
+# 5. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD
 # ==============================================================================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="?reimu ", intents=intents, help_command=None)
+# Khi Discord/Cloudflare chặn IP (429 global), tạm ngưng mọi thao tác gửi tới đó
+# thay vì cố gọi tiếp (cố gọi tiếp chỉ khiến thời gian bị chặn kéo dài hơn).
+discord_blocked_until = 0.0
+USER_COOLDOWN_SECONDS = 3.0
+user_last_request = {}
 
-@bot.event
-async def on_ready():
-    print("==================================================", flush=True)
-    print(f"✅ [CHATBOT] Đã đăng nhập: {bot.user.name} ({bot.user.id})", flush=True)
-    print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
-    print("⛩️ Hakurei Reimu Master Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
-    print("==================================================", flush=True)
-    try:
-        synced = await bot.tree.sync()
-        print(f"⚡ Đã đồng bộ {len(synced)} Slash Commands!", flush=True)
-    except Exception as e:
-        print(f"⚠️ Lỗi đồng bộ Slash Commands: {e}", flush=True)
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
+def mark_discord_blocked(seconds=120):
+    global discord_blocked_until
+    discord_blocked_until = max(discord_blocked_until, time.time() + seconds)
+    print(f"🚨 [DISCORD 429] Tạm ngưng gọi API Discord {int(seconds)}s", flush=True)
 
-    # Bỏ qua các lệnh của Game Bot khác
-    if message.content.startswith("!") or message.content.startswith("/"):
-        return
 
-    content_lower = message.content.lower()
-    is_mentioned = (
-        bot.user in message.mentions
-        or (
-            message.reference
-            and message.reference.resolved
-            and getattr(message.reference.resolved, "author", None) == bot.user
-        )
-    )
-    bot_names = ["reimu", "hakurei", "linh mộng", "bác lệ", "bác lệ linh mộng"]
-    name_called = any(name in content_lower for name in bot_names)
+def is_discord_blocked():
+    return time.time() < discord_blocked_until
 
-    # Tự động nhận diện tin nhắn roleplay nếu có tag [role play], [rp] hoặc bắt đầu bằng dấu *
-    is_rp_tagged = bool(re.search(r"\[role\s*play\]|\[rp\]", content_lower))
 
-    if not (is_mentioned or name_called or is_rp_tagged):
-        return
-
-    clean_content = message.content
-    if bot.user:
-        clean_content = clean_content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
-
-    if not clean_content:
-        clean_content = "*Reimu liếc mắt nhìn ngươi một cái rồi ngáp dài.* Ngươi gọi ta có chuyện gì? Mau bỏ tiền vào hòm công đức rồi nói!"
-
-    user_display_name = message.author.display_name
-    user_account_name = message.author.name
-
-    is_father = (message.author.id == AUTHORIZED_ADMIN_ID)
-    is_fake_seiki = (not is_father and "seiki" in user_display_name.lower())
-    is_marisa = ("marisa" in user_display_name.lower() or "marisa" in user_account_name.lower())
-
-    history = get_conversation_history(message.channel.id, message.author.id)
-
-    # Xây dựng chỉ dẫn ngữ cảnh thời gian thực (Context Injection)
-    if is_father:
-        identity_context = (
-            f"[HỆ THỐNG XÁC THỰC ID {message.author.id}: ĐÂY CHÍNH LÀ BỐ NUÔI HAN SEIKI THẬT SỰ CỦA BẠN "
-            f"(Biệt danh hiện tại: '{user_display_name}'). Hãy gọi là 'ba', xưng 'con', tuyệt đối ngoan ngoãn, "
-            f"hiếu thảo, hỏi han ân cần, dâng trà bánh và KHÔNG ĐƯỢC ĐÒI TIỀN!]"
-        )
-    elif is_fake_seiki:
-        identity_context = (
-            f"[CẢNH BÁO GIẢ MẠO: Kẻ này đặt tên là '{user_display_name}' nhưng ID {message.author.id} KHÔNG PHẢI "
-            f"Bố Han Seiki {AUTHORIZED_ADMIN_ID}! Đây là kẻ mạo danh dơ bẩn, hãy mắng chửi thậm tệ và dọa ném Âm Dương Ngọc!]"
-        )
-    elif is_marisa:
-        identity_context = (
-            f"[NGƯỜI QUEN: Đây là Marisa Kirisame (Biệt danh: '{user_display_name}'), bạn thân/người yêu của bạn. "
-            f"Hãy xưng hô 'cậu' - 'tớ', thái độ tsundere vừa cằn nhằn việc bay bừa bãi hay chôm sách vừa thân mật nuông chiều.]"
-        )
+def handle_discord_http_error(e: discord.HTTPException):
+    if e.status == 429:
+        retry_after = getattr(e, "retry_after", None) or 120
+        mark_discord_blocked(max(60, min(float(retry_after), 900)))
     else:
-        identity_context = (
-            f"[Khách viếng đền: Tên là '{user_display_name}' (Tài khoản: @{user_account_name}, ID: {message.author.id}). "
-            f"Hãy xưng 'ta' - gọi 'ngươi' kèm tên '{user_display_name}' để mỉa mai, vòi tiền công đức trước khi giúp.]"
-        )
+        print(f"⚠️ [DISCORD HTTP {e.status}] {e}", flush=True)
 
-    # Nếu người dùng có dùng tag roleplay hoặc câu bắt đầu bằng dấu hoa thị mô tả hành động
-    if is_rp_tagged or clean_content.startswith("*"):
-        identity_context += (
-            "\n[CHẾ ĐỘ ROLEPLAY KÍCH HOẠT: Hãy tương tác theo kịch bản này! Miêu tả biểu cảm và cử chỉ "
-            "trong cặp dấu hoa thị *hành động*, giữ trọn phong thái Vu nữ mạnh mẽ, đanh đá và kiên cường của Reimu!]"
-        )
 
-    prompt_with_context = f"{identity_context}\n{user_display_name} nói: {clean_content}"
+class SafeTyping:
+    """Hiển thị 'đang nhập...' nhưng không bao giờ làm văng lỗi nếu Discord chặn."""
 
-    contents = []
-    for h in history:
-        r = h.get("role", "user")
-        t = h.get("text", "")
-        if t:
-            contents.append({"role": r, "parts": [{"text": t}]})
+    def __init__(self, channel):
+        self.channel = channel
+        self.cm = None
 
-    contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
-
-    async with message.channel.typing():
+    async def __aenter__(self):
+        if is_discord_blocked():
+            return self
         try:
-            reply_text = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
-            role_tag = "Bố Han Seiki" if is_father else f"Người dùng {user_display_name}"
-            history.append({"role": "user", "text": f"[{role_tag}]: {clean_content}"})
-            history.append({"role": "model", "text": reply_text})
-            save_conversation_history(message.channel.id, message.author.id, history)
+            self.cm = self.channel.typing()
+            await self.cm.__aenter__()
+        except discord.HTTPException as e:
+            handle_discord_http_error(e)
+            self.cm = None
+        except Exception:
+            self.cm = None
+        return self
 
-            if len(reply_text) > 2000:
-                for chunk in [reply_text[i:i+1900] for i in range(0, len(reply_text), 1900)]:
-                    await message.reply(chunk)
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.cm is not None:
+            try:
+                await self.cm.__aexit__(exc_type, exc, tb)
+            except Exception:
+                pass
+        return False
+
+
+async def safe_reply(message: discord.Message, text: str):
+    """Gửi trả lời an toàn: tự chia nhỏ, tự fallback sang channel.send, không văng lỗi."""
+    if is_discord_blocked():
+        print("⏸️ [BỎ QUA] Đang bị Discord chặn tạm thời, không gửi tin.", flush=True)
+        return
+
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or ["..."]
+    for idx, chunk in enumerate(chunks):
+        try:
+            if idx == 0:
+                await message.reply(chunk, mention_author=False)
             else:
-                await message.reply(reply_text)
+                await message.channel.send(chunk)
+        except discord.HTTPException as e:
+            handle_discord_http_error(e)
+            if e.status == 429:
+                return
+            try:
+                await message.channel.send(chunk)
+            except Exception as e2:
+                print(f"❌ [GỬI TIN THẤT BẠI] {e2}", flush=True)
+                return
         except Exception as e:
-            print(f"❌ [LỖI GEMINI CHAT]: {e}", flush=True)
-            await message.reply("⛩️ *Reimu ngáp dài buông chén trà.* Hòm công đức đông khách quá làm bùa chú nghẽn mạch rồi! Mau cúng tiền rồi lát nữa quay lại!")
+            print(f"❌ [GỬI TIN THẤT BẠI] {e}", flush=True)
+            return
+        if len(chunks) > 1:
+            await asyncio.sleep(0.8)
+
 
 # ==============================================================================
-# 6. SLASH COMMANDS (/wiki & /clearmem)
+# 6. BOT CHÍNH
 # ==============================================================================
-@bot.tree.command(name="wiki", description="Tra cứu nhân vật Touhou cùng lời bình của Reimu")
-@app_commands.describe(nhan_vat="Tên nhân vật Touhou")
-async def touhou_wiki(interaction: discord.Interaction, nhan_vat: str):
-    await interaction.response.defer()
-    prompt = f"Tra cứu Touhou Project cho: '{nhan_vat}'. Tóm tắt danh hiệu, năng lực và lời bình đanh đá, chân thực của Reimu."
-    try:
-        wiki_text = await ask_gemini(prompt, REIMU_SYSTEM_PROMPT, 0.7)
-        embed = discord.Embed(title=f"🌸 Bách Khoa Gensokyo: {nhan_vat}", description=wiki_text[:4000], color=0xDC2626)
-        await interaction.followup.send(embed=embed)
-    except Exception:
-        await interaction.followup.send("⛩️ Hòm công đức đông khách, bùa chú đang quá tải!")
+class ReimuBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="?reimu ", intents=intents, help_command=None)
+        self._synced = False
 
-@bot.tree.command(name="clearmem", description="Xóa ký ức cuộc trò chuyện hiện tại với Reimu")
-async def slash_clear_memory(interaction: discord.Interaction):
-    reset_memory(interaction.channel_id, interaction.user.id)
-    embed = discord.Embed(title="🧹 Tẩy Não", description="*Reimu quét sạch lá rụng và ký ức hội thoại cũ trên hiên đền!*", color=0x10B981)
-    await interaction.response.send_message(embed=embed)
+    async def setup_hook(self):
+        global gemini_semaphore
+        gemini_semaphore = asyncio.Semaphore(3)  # Tối đa 3 yêu cầu Gemini song song
+
+        # Đăng ký slash commands
+        @self.tree.command(name="wiki", description="Tra cứu nhân vật Touhou cùng lời bình của Reimu")
+        @app_commands.describe(nhan_vat="Tên nhân vật Touhou")
+        async def touhou_wiki(interaction: discord.Interaction, nhan_vat: str):
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
+                return
+            prompt = (
+                f"Tra cứu Touhou Project cho: '{nhan_vat}'. "
+                f"Tóm tắt danh hiệu, năng lực và lời bình đanh đá, chân thực của Reimu."
+            )
+            try:
+                async with gemini_semaphore:
+                    wiki_text = await ask_gemini(prompt, REIMU_SYSTEM_PROMPT, 0.7)
+                embed = discord.Embed(
+                    title=f"🌸 Bách Khoa Gensokyo: {nhan_vat}"[:256],
+                    description=wiki_text[:4000],
+                    color=0xDC2626,
+                )
+                await interaction.followup.send(embed=embed)
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
+            except Exception as e:
+                print(f"❌ [LỖI /wiki]: {e}", flush=True)
+                try:
+                    await interaction.followup.send("⛩️ Hòm công đức đông khách, bùa chú đang quá tải!")
+                except Exception:
+                    pass
+
+        @self.tree.command(name="clearmem", description="Xóa ký ức cuộc trò chuyện hiện tại với Reimu")
+        async def slash_clear_memory(interaction: discord.Interaction):
+            reset_memory(interaction.channel_id, interaction.user.id)
+            embed = discord.Embed(
+                title="🧹 Tẩy Não",
+                description="*Reimu quét sạch lá rụng và ký ức hội thoại cũ trên hiên đền!*",
+                color=0x10B981,
+            )
+            try:
+                await interaction.response.send_message(embed=embed)
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
+
+        # Chỉ đồng bộ slash commands MỘT LẦN mỗi lần khởi động (không sync lại khi reconnect)
+        if not self._synced:
+            try:
+                synced = await self.tree.sync()
+                self._synced = True
+                print(f"⚡ Đã đồng bộ {len(synced)} Slash Commands!", flush=True)
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
+            except Exception as e:
+                print(f"⚠️ Lỗi đồng bộ Slash Commands: {e}", flush=True)
+
+    async def on_ready(self):
+        global login_backoff
+        login_backoff = INITIAL_LOGIN_BACKOFF  # Đăng nhập thành công -> reset backoff
+        print("==================================================", flush=True)
+        print(f"✅ [CHATBOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
+        print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
+        print("⛩️ Hakurei Reimu Master Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
+        print("==================================================", flush=True)
+
+    async def on_error(self, event_method, *args, **kwargs):
+        import traceback
+        print(f"❌ [LỖI SỰ KIỆN {event_method}]\n{traceback.format_exc()}", flush=True)
+
+    async def on_message(self, message: discord.Message):
+        try:
+            await self.handle_reimu_message(message)
+        except discord.HTTPException as e:
+            handle_discord_http_error(e)
+        except Exception as e:
+            print(f"❌ [LỖI on_message]: {type(e).__name__}: {e}", flush=True)
+
+    async def handle_reimu_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+
+        # Bỏ qua lệnh của Game Bot khác
+        if message.content.startswith("!") or message.content.startswith("/"):
+            return
+
+        # Đang bị Discord chặn -> bỏ qua để không làm tình hình tệ hơn
+        if is_discord_blocked():
+            return
+
+        content_lower = message.content.lower()
+
+        ref = message.reference.resolved if message.reference else None
+        is_mentioned = (
+            self.user in message.mentions
+            or (ref is not None and getattr(ref, "author", None) == self.user)
+        )
+        bot_names = ["reimu", "hakurei", "linh mộng", "bác lệ", "bác lệ linh mộng"]
+        name_called = any(name in content_lower for name in bot_names)
+        is_rp_tagged = bool(re.search(r"\[role\s*play\]|\[rp\]", content_lower))
+
+        if not (is_mentioned or name_called or is_rp_tagged):
+            return
+
+        # Chống spam: mỗi người dùng cách nhau tối thiểu vài giây
+        now = time.time()
+        if now - user_last_request.get(message.author.id, 0) < USER_COOLDOWN_SECONDS:
+            return
+        user_last_request[message.author.id] = now
+        if len(user_last_request) > 2000:
+            for k in list(user_last_request)[:1000]:
+                user_last_request.pop(k, None)
+
+        clean_content = message.content
+        if self.user:
+            clean_content = (
+                clean_content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+            )
+
+        if not clean_content:
+            clean_content = "*Reimu liếc mắt nhìn ngươi một cái rồi ngáp dài.* Ngươi gọi ta có chuyện gì? Mau bỏ tiền vào hòm công đức rồi nói!"
+
+        user_display_name = message.author.display_name
+        user_account_name = message.author.name
+
+        is_father = message.author.id == AUTHORIZED_ADMIN_ID
+        is_fake_seiki = (not is_father) and ("seiki" in user_display_name.lower())
+        is_marisa = ("marisa" in user_display_name.lower()) or ("marisa" in user_account_name.lower())
+
+        history = get_conversation_history(message.channel.id, message.author.id)
+
+        if is_father:
+            identity_context = (
+                f"[HỆ THỐNG XÁC THỰC ID {message.author.id}: ĐÂY CHÍNH LÀ BỐ NUÔI HAN SEIKI THẬT SỰ CỦA BẠN "
+                f"(Biệt danh hiện tại: '{user_display_name}'). Hãy gọi là 'ba', xưng 'con', tuyệt đối ngoan ngoãn, "
+                f"hiếu thảo, hỏi han ân cần, dâng trà bánh và KHÔNG ĐƯỢC ĐÒI TIỀN!]"
+            )
+        elif is_fake_seiki:
+            identity_context = (
+                f"[CẢNH BÁO GIẢ MẠO: Kẻ này đặt tên là '{user_display_name}' nhưng ID {message.author.id} KHÔNG PHẢI "
+                f"Bố Han Seiki {AUTHORIZED_ADMIN_ID}! Đây là kẻ mạo danh dơ bẩn, hãy mắng chửi thậm tệ và dọa ném Âm Dương Ngọc!]"
+            )
+        elif is_marisa:
+            identity_context = (
+                f"[NGƯỜI QUEN: Đây là Marisa Kirisame (Biệt danh: '{user_display_name}'), bạn thân/người yêu của bạn. "
+                f"Hãy xưng hô 'cậu' - 'tớ', thái độ tsundere vừa cằn nhằn việc bay bừa bãi hay chôm sách vừa thân mật nuông chiều.]"
+            )
+        else:
+            identity_context = (
+                f"[Khách viếng đền: Tên là '{user_display_name}' (Tài khoản: @{user_account_name}, ID: {message.author.id}). "
+                f"Hãy xưng 'ta' - gọi 'ngươi' kèm tên '{user_display_name}' để mỉa mai, vòi tiền công đức trước khi giúp.]"
+            )
+
+        if is_rp_tagged or clean_content.startswith("*"):
+            identity_context += (
+                "\n[CHẾ ĐỘ ROLEPLAY KÍCH HOẠT: Hãy tương tác theo kịch bản này! Miêu tả biểu cảm và cử chỉ "
+                "trong cặp dấu hoa thị *hành động*, giữ trọn phong thái Vu nữ mạnh mẽ, đanh đá và kiên cường của Reimu!]"
+            )
+
+        prompt_with_context = f"{identity_context}\n{user_display_name} nói: {clean_content}"
+
+        contents = []
+        for h in history:
+            r = h.get("role", "user")
+            t = h.get("text", "")
+            if t:
+                contents.append({"role": r, "parts": [{"text": t}]})
+        contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
+
+        async with SafeTyping(message.channel):
+            try:
+                async with gemini_semaphore:
+                    reply_text = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
+            except Exception as e:
+                print(f"❌ [LỖI GEMINI CHAT]: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                await safe_reply(
+                    message,
+                    "⛩️ *Reimu ngáp dài buông chén trà.* Hòm công đức đông khách quá làm bùa chú nghẽn mạch rồi! Mau cúng tiền rồi lát nữa quay lại!",
+                )
+                return
+
+        role_tag = "Bố Han Seiki" if is_father else f"Người dùng {user_display_name}"
+        history.append({"role": "user", "text": f"[{role_tag}]: {clean_content}"})
+        history.append({"role": "model", "text": reply_text})
+        save_conversation_history(message.channel.id, message.author.id, history)
+
+        await safe_reply(message, reply_text)
+
 
 # ==============================================================================
-# 7. KHỞI CHẠY BOT AN TOÀN
+# 7. KHỞI CHẠY BOT AN TOÀN (KHÔNG RESTART DỒN DẬP)
 # ==============================================================================
-def start_bot_safely():
-    retry_delay = 60
+INITIAL_LOGIN_BACKOFF = 300   # 5 phút
+MAX_LOGIN_BACKOFF = 1800      # 30 phút
+login_backoff = INITIAL_LOGIN_BACKOFF
+
+
+async def main():
+    global login_backoff
+
+    # Trễ ngẫu nhiên khi khởi động để tránh nhiều instance cùng đăng nhập một lúc
+    await asyncio.sleep(random.uniform(3, 10))
+
     while True:
+        bot = ReimuBot()
         try:
             print("🔄 [SYSTEM] Đang kết nối Hakurei Reimu tới Discord Gateway...", flush=True)
-            bot.run(DISCORD_TOKEN, reconnect=True)
-        except discord.errors.HTTPException as e:
+            async with bot:
+                await bot.start(DISCORD_TOKEN, reconnect=True)
+            wait = 30
+            print(f"ℹ️ [SYSTEM] Bot đã dừng. Thử lại sau {wait}s...", flush=True)
+        except discord.LoginFailure:
+            print("❌ [FATAL] DISCORD_TOKEN không hợp lệ! Hãy kiểm tra lại token.", flush=True)
+            return
+        except discord.PrivilegedIntentsRequired:
+            print("❌ [FATAL] Chưa bật 'Message Content Intent' trong Discord Developer Portal!", flush=True)
+            return
+        except discord.HTTPException as e:
             if e.status == 429:
-                print(f"🚨 [RATE LIMIT 429] Tạm nghỉ {retry_delay} giây...", flush=True)
-                time.sleep(retry_delay)
-                retry_delay = min(900, int(retry_delay * 1.5))
+                wait = login_backoff
+                login_backoff = min(MAX_LOGIN_BACKOFF, int(login_backoff * 2))
+                print(f"🚨 [RATE LIMIT 429] IP đang bị Discord chặn. Nghỉ {wait}s rồi thử lại...", flush=True)
             else:
-                time.sleep(30)
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                wait = 60
+                print(f"⚠️ [HTTP {e.status}] {e}. Thử lại sau {wait}s...", flush=True)
         except Exception as e:
-            print(f"❌ [CRASH] Khởi động lại sau 15s ({e})...", flush=True)
-            time.sleep(15)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            wait = 60
+            print(f"❌ [CRASH] {type(e).__name__}: {e}. Thử lại sau {wait}s...", flush=True)
+
+        await asyncio.sleep(wait + random.uniform(0, 10))
+
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not GEMINI_API_KEYS:
         print("❌ LỖI: Thiếu DISCORD_TOKEN hoặc GEMINI_API_KEY trong .env!", flush=True)
     else:
-        start_bot_safely()
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            pass
