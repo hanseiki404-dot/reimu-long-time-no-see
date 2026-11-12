@@ -1,6 +1,8 @@
 # ==============================================================================
-# HAKUREI REIMU CHATBOT EDITION v2.1 - MASTER ROLEPLAY EDITION (BẢN CHỐNG 429)
-# GEMINI FALLBACK + BỘ NHỚ RAM + CHỐNG RATE-LIMIT DISCORD
+# HAKUREI REIMU CHATBOT EDITION v2.2 - MASTER ROLEPLAY EDITION
+# - Tự dò model Gemini còn tồn tại (hết lỗi 404 NOT_FOUND)
+# - Dùng client async (aio) + timeout + retry theo từng model/key
+# - Giảm tối đa số request gửi tới Discord để tránh 429
 # ==============================================================================
 import os
 import re
@@ -19,6 +21,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name, default=False):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ==============================================================================
 # 1. CẤU HÌNH ID BỐ NUÔI HAN SEIKI / ADMIN & BỘ NHỚ RAM
 # ==============================================================================
@@ -26,7 +50,7 @@ AUTHORIZED_ADMIN_ID = 1502579398560317441
 
 chat_memory = {}
 MAX_HISTORY = 10
-MAX_MEMORY_KEYS = 500  # Giới hạn số cuộc hội thoại lưu trên RAM để tránh phình bộ nhớ
+MAX_MEMORY_KEYS = 500
 
 
 def get_history_key(channel_id, user_id):
@@ -39,8 +63,11 @@ def get_conversation_history(channel_id, user_id):
 
 def save_conversation_history(channel_id, user_id, history_list):
     key = get_history_key(channel_id, user_id)
-    chat_memory[key] = history_list[-MAX_HISTORY:]
-    # Dọn bớt khi quá nhiều (xóa các key cũ nhất)
+    trimmed = history_list[-MAX_HISTORY:]
+    # Gemini cần lịch sử bắt đầu bằng lượt của "user"
+    while trimmed and trimmed[0].get("role") != "user":
+        trimmed.pop(0)
+    chat_memory[key] = trimmed
     while len(chat_memory) > MAX_MEMORY_KEYS:
         chat_memory.pop(next(iter(chat_memory)), None)
 
@@ -92,7 +119,7 @@ threading.Thread(target=run_web_server, daemon=True).start()
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ==============================================================================
-# 3. CẤU HÌNH GEMINI (XOAY VÒNG KEY + FALLBACK MODEL)
+# 3. CẤU HÌNH GEMINI (XOAY VÒNG KEY + FALLBACK MODEL + TỰ DÒ MODEL)
 # ==============================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -100,93 +127,198 @@ raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or ""
 GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
 
-# Có thể ghi đè bằng biến môi trường GEMINI_MODELS="model1,model2,..."
-_default_models = [
-    "gemini-3.8-flash",
-    "gemini-3.8-flash-lite",
-    "gemini-flash-lite-latest",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.0-flash",
-    "gemini-3-flash-preview",
-]
-_env_models = os.getenv("GEMINI_MODELS", "")
-FALLBACK_MODELS = [m.strip() for m in _env_models.split(",") if m.strip()] or _default_models
+# Danh sách ưu tiên (có thể ghi đè bằng biến môi trường GEMINI_MODELS="a,b,c").
+# Model nào KHÔNG tồn tại trên API sẽ tự bị loại nhờ bước dò model bên dưới.
+_DEFAULT_MODELS = (
+    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,"
+    "gemini-3.5-flash-lite,gemini-3.1-flash-lite,"
+    "gemini-flash-latest,gemini-flash-lite-latest"
+)
+PREFERRED_MODELS = [
+    m.strip() for m in os.getenv("GEMINI_MODELS", _DEFAULT_MODELS).split(",") if m.strip()
+] or [m.strip() for m in _DEFAULT_MODELS.split(",")]
 
-cooldown_tracker = {}
-gemini_semaphore = None  # Tạo trong event loop (xem ReimuBot.setup_hook)
+RETRIES_PER_MODEL = max(1, _env_int("GEMINI_RETRIES_PER_MODEL", 2))
+GEMINI_TIMEOUT = _env_float("GEMINI_TIMEOUT", 35.0)
+MODEL_REFRESH_SECONDS = 6 * 3600
 
+MSG_QUOTA = "⛩️ *Reimu ngáp dài buông chén trà.* Hòm công đức đông khách quá làm bùa chú nghẽn mạch rồi! Mau cúng tiền rồi lát nữa quay lại!"
+MSG_SAFETY = "⛩️ *Reimu nhíu mày, vung gohei gạt phăng câu đó đi.* \"Câu này ta không thèm đáp! Đổi chủ đề đi, đồ rảnh rỗi!\""
+MSG_EMPTY = "⛩️ *Reimu chớp mắt ngơ ngác.* \"Ta lỡ thần người mất rồi... Nói lại xem nào!\""
 
-def _call_gemini_sync(client, model_name, contents, system_instruction, temperature):
-    return client.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=temperature,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
+cooldown_tracker = {}          # (key_idx, model) -> thời điểm hết cooldown
+_available_models = set()      # model thực sự có trên API (dò tự động)
+_active_models = list(PREFERRED_MODELS)
+_models_checked_at = 0.0
+_models_lock = None
+gemini_semaphore = None
+
+SAFETY_SETTINGS = [
+    types.SafetySetting(category=c, threshold="BLOCK_ONLY_HIGH")
+    for c in (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
     )
+]
+
+
+def _get_sem():
+    global gemini_semaphore
+    if gemini_semaphore is None:
+        gemini_semaphore = asyncio.Semaphore(3)
+    return gemini_semaphore
+
+
+async def _refresh_models():
+    """Hỏi API xem model nào có thật & hỗ trợ generateContent, rồi lọc danh sách ưu tiên."""
+    global _active_models, _models_checked_at, _available_models
+    found = set()
+    try:
+        pager = await GEMINI_CLIENTS[0].aio.models.list()
+        async for m in pager:
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" in actions:
+                found.add((m.name or "").replace("models/", ""))
+    except Exception as e:
+        print(f"⚠️ [MODEL] Không dò được danh sách model: {str(e)[:150]}", flush=True)
+
+    _models_checked_at = time.time()
+    if not found:
+        # Dò thất bại -> dùng nguyên danh sách ưu tiên, lỗi 404 sẽ tự cooldown
+        _active_models = list(PREFERRED_MODELS)
+        return
+
+    _available_models = found
+    chosen = [m for m in PREFERRED_MODELS if m in found]
+    if not chosen:
+        # Không model ưu tiên nào tồn tại -> lấy các model "flash" ổn định có sẵn
+        bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "thinking-exp")
+        chosen = sorted(
+            m for m in found if "flash" in m and not any(b in m for b in bad)
+        )[:6]
+    _active_models = chosen or list(PREFERRED_MODELS)
+    print(f"🧠 [MODEL] Danh sách đang dùng: {', '.join(_active_models)}", flush=True)
+
+
+async def get_active_models():
+    global _models_lock
+    if _models_lock is None:
+        _models_lock = asyncio.Lock()
+    if time.time() - _models_checked_at > MODEL_REFRESH_SECONDS:
+        async with _models_lock:
+            if time.time() - _models_checked_at > MODEL_REFRESH_SECONDS:
+                await _refresh_models()
+    return list(_active_models)
+
+
+def _classify_gemini_error(e: Exception) -> str:
+    code = getattr(e, "code", None)
+    text = str(e).upper()
+    if code == 429 or "429" in text or "RESOURCE_EXHAUSTED" in text:
+        return "quota"
+    if code == 404 or "404" in text or "NOT_FOUND" in text:
+        return "missing"
+    if code in (500, 502, 503, 504) or "503" in text or "UNAVAILABLE" in text or "DEADLINE" in text:
+        return "retry"
+    return "other"
+
+
+def _extract_text(resp):
+    """Trả về (text, blocked_by_safety)."""
+    try:
+        text = resp.text
+    except Exception:
+        text = None
+    if text and text.strip():
+        return text.strip(), False
+
+    blocked = False
+    pf = getattr(resp, "prompt_feedback", None)
+    if pf is not None and getattr(pf, "block_reason", None):
+        blocked = True
+    for c in getattr(resp, "candidates", None) or []:
+        fr = str(getattr(c, "finish_reason", "") or "").upper()
+        if "SAFETY" in fr or "PROHIBITED" in fr or "BLOCKLIST" in fr or "SPII" in fr:
+            blocked = True
+    return None, blocked
 
 
 async def ask_gemini(contents, system_instruction, temperature=0.85):
-    last_err = None
+    """Trả về (text, ok). ok=False nghĩa là text là thông báo lỗi có sẵn (không lưu vào lịch sử)."""
+    if not GEMINI_CLIENTS:
+        print("❌ ask_gemini: chưa có GEMINI_API_KEY", flush=True)
+        return MSG_QUOTA, False
 
-    for key_idx, client in enumerate(GEMINI_CLIENTS):
-        for model_name in FALLBACK_MODELS:
-            tracker_key = (key_idx, model_name)
-            if cooldown_tracker.get(tracker_key, 0) > time.time():
-                continue
+    models = await get_active_models()
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=temperature,
+        safety_settings=SAFETY_SETTINGS,
+    )
 
-            for attempt in range(2):
-                try:
-                    resp = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _call_gemini_sync, client, model_name, contents, system_instruction, temperature
-                        ),
-                        timeout=60,
-                    )
-                    text = getattr(resp, "text", None)
-                    if text:
-                        return text
-                    # Phản hồi rỗng (bị chặn safety...) -> thử model khác
-                    last_err = RuntimeError(f"Phản hồi rỗng từ {model_name}")
-                    break
-                except asyncio.TimeoutError:
-                    last_err = RuntimeError(f"Timeout {model_name}")
-                    cooldown_tracker[tracker_key] = time.time() + 30
-                    break
-                except Exception as e:
-                    last_err = e
-                    err_str = str(e)
+    async with _get_sem():
+        for key_idx, client in enumerate(GEMINI_CLIENTS):
+            for model_name in models:
+                tracker_key = (key_idx, model_name)
+                if cooldown_tracker.get(tracker_key, 0) > time.time():
+                    continue
 
-                    # 429: vượt quota
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        if "PerDay" in err_str or "limit: 0" in err_str:
-                            cooldown_tracker[tracker_key] = time.time() + 3600
-                            print(f"⚠️ [HẾT QUOTA NGÀY] Key #{key_idx+1} | {model_name}", flush=True)
-                        else:
-                            cooldown_tracker[tracker_key] = time.time() + 20
-                            print(f"⚠️ [CHẠM QUOTA PHÚT] Key #{key_idx+1} | {model_name}", flush=True)
-                        break
-
-                    # 503: quá tải
-                    if "503" in err_str or "UNAVAILABLE" in err_str:
-                        if attempt == 0:
-                            await asyncio.sleep(0.6)
-                            continue
+                for attempt in range(RETRIES_PER_MODEL):
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.aio.models.generate_content(
+                                model=model_name, contents=contents, config=config
+                            ),
+                            timeout=GEMINI_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
                         cooldown_tracker[tracker_key] = time.time() + 30
-                        print(f"⚠️ [503 QUÁ TẢI] {model_name}", flush=True)
+                        print(f"⚠️ [TIMEOUT] Key #{key_idx+1} | {model_name}", flush=True)
+                        break
+                    except Exception as e:
+                        kind = _classify_gemini_error(e)
+                        err_str = str(e)
+
+                        if kind == "quota":
+                            if "PerDay" in err_str or "limit: 0" in err_str:
+                                cooldown_tracker[tracker_key] = time.time() + 3600
+                                print(f"⚠️ [HẾT QUOTA NGÀY] Key #{key_idx+1} | {model_name}", flush=True)
+                            else:
+                                cooldown_tracker[tracker_key] = time.time() + 20
+                                print(f"⚠️ [CHẠM QUOTA PHÚT] Key #{key_idx+1} | {model_name}", flush=True)
+                            break
+
+                        if kind == "retry":
+                            if attempt + 1 < RETRIES_PER_MODEL:
+                                await asyncio.sleep(1.0 + random.random())
+                                continue
+                            cooldown_tracker[tracker_key] = time.time() + 20
+                            print(f"⚠️ [503 QUÁ TẢI] {model_name}", flush=True)
+                            break
+
+                        if kind == "missing":
+                            # Model không tồn tại -> bỏ qua 6 tiếng và ép dò lại danh sách
+                            cooldown_tracker[tracker_key] = time.time() + 6 * 3600
+                            global _models_checked_at
+                            _models_checked_at = 0.0
+                            print(f"⚠️ [MODEL 404] {model_name} không tồn tại, bỏ qua.", flush=True)
+                            break
+
+                        cooldown_tracker[tracker_key] = time.time() + 600
+                        print(f"⚠️ [LỖI MODEL] {model_name}: {err_str[:150]}", flush=True)
                         break
 
-                    # Model không tồn tại / không khả dụng -> bỏ qua 1 tiếng
-                    cooldown_tracker[tracker_key] = time.time() + 3600
-                    print(f"⚠️ [LỖI MODEL] {model_name}: {err_str[:150]}", flush=True)
+                    text, blocked = _extract_text(resp)
+                    if text:
+                        return text, True
+                    if blocked:
+                        return MSG_SAFETY, False
+                    print(f"⚠️ [RỖNG] {model_name} trả về rỗng, thử model khác.", flush=True)
                     break
 
-    if last_err is None:
-        last_err = RuntimeError("Tất cả model/key đang trong thời gian cooldown")
-    raise last_err
+    return MSG_QUOTA, False
 
 
 # ==============================================================================
@@ -248,11 +380,15 @@ Reimu: *Reimu bật dậy trong chớp mắt, dải ruy băng đỏ và vạt á
 # ==============================================================================
 # 5. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD
 # ==============================================================================
-# Khi Discord/Cloudflare chặn IP (429 global), tạm ngưng mọi thao tác gửi tới đó
-# thay vì cố gọi tiếp (cố gọi tiếp chỉ khiến thời gian bị chặn kéo dài hơn).
 discord_blocked_until = 0.0
 USER_COOLDOWN_SECONDS = 3.0
 user_last_request = {}
+
+# Mỗi lần "đang nhập..." là 1 request tới Discord -> dễ gây 429 trên hosting dùng chung IP.
+# Mặc định TẮT. Bật bằng biến môi trường TYPING_INDICATOR=1
+TYPING_INDICATOR = _env_bool("TYPING_INDICATOR", False)
+# Đồng bộ slash command mỗi lần khởi động. Sau khi đã sync xong 1 lần, có thể đặt SYNC_COMMANDS=0
+SYNC_COMMANDS = _env_bool("SYNC_COMMANDS", True)
 
 
 def mark_discord_blocked(seconds=120):
@@ -281,7 +417,7 @@ class SafeTyping:
         self.cm = None
 
     async def __aenter__(self):
-        if is_discord_blocked():
+        if not TYPING_INDICATOR or is_discord_blocked():
             return self
         try:
             self.cm = self.channel.typing()
@@ -334,6 +470,11 @@ async def safe_reply(message: discord.Message, text: str):
 # ==============================================================================
 # 6. BOT CHÍNH
 # ==============================================================================
+INITIAL_LOGIN_BACKOFF = 300   # 5 phút
+MAX_LOGIN_BACKOFF = 1800      # 30 phút
+login_backoff = INITIAL_LOGIN_BACKOFF
+
+
 class ReimuBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -342,10 +483,6 @@ class ReimuBot(commands.Bot):
         self._synced = False
 
     async def setup_hook(self):
-        global gemini_semaphore
-        gemini_semaphore = asyncio.Semaphore(3)  # Tối đa 3 yêu cầu Gemini song song
-
-        # Đăng ký slash commands
         @self.tree.command(name="wiki", description="Tra cứu nhân vật Touhou cùng lời bình của Reimu")
         @app_commands.describe(nhan_vat="Tên nhân vật Touhou")
         async def touhou_wiki(interaction: discord.Interaction, nhan_vat: str):
@@ -359,8 +496,10 @@ class ReimuBot(commands.Bot):
                 f"Tóm tắt danh hiệu, năng lực và lời bình đanh đá, chân thực của Reimu."
             )
             try:
-                async with gemini_semaphore:
-                    wiki_text = await ask_gemini(prompt, REIMU_SYSTEM_PROMPT, 0.7)
+                wiki_text, ok = await ask_gemini(prompt, REIMU_SYSTEM_PROMPT, 0.7)
+                if not ok:
+                    await interaction.followup.send(wiki_text)
+                    return
                 embed = discord.Embed(
                     title=f"🌸 Bách Khoa Gensokyo: {nhan_vat}"[:256],
                     description=wiki_text[:4000],
@@ -372,7 +511,7 @@ class ReimuBot(commands.Bot):
             except Exception as e:
                 print(f"❌ [LỖI /wiki]: {e}", flush=True)
                 try:
-                    await interaction.followup.send("⛩️ Hòm công đức đông khách, bùa chú đang quá tải!")
+                    await interaction.followup.send(MSG_QUOTA)
                 except Exception:
                     pass
 
@@ -389,8 +528,7 @@ class ReimuBot(commands.Bot):
             except discord.HTTPException as e:
                 handle_discord_http_error(e)
 
-        # Chỉ đồng bộ slash commands MỘT LẦN mỗi lần khởi động (không sync lại khi reconnect)
-        if not self._synced:
+        if SYNC_COMMANDS and not self._synced and not is_discord_blocked():
             try:
                 synced = await self.tree.sync()
                 self._synced = True
@@ -402,12 +540,15 @@ class ReimuBot(commands.Bot):
 
     async def on_ready(self):
         global login_backoff
-        login_backoff = INITIAL_LOGIN_BACKOFF  # Đăng nhập thành công -> reset backoff
+        login_backoff = INITIAL_LOGIN_BACKOFF
         print("==================================================", flush=True)
         print(f"✅ [CHATBOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
         print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
         print("⛩️ Hakurei Reimu Master Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
         print("==================================================", flush=True)
+        # Dò model sớm để log ra danh sách đang dùng
+        if GEMINI_CLIENTS:
+            await get_active_models()
 
     async def on_error(self, event_method, *args, **kwargs):
         import traceback
@@ -425,11 +566,10 @@ class ReimuBot(commands.Bot):
         if message.author.bot:
             return
 
-        # Bỏ qua lệnh của Game Bot khác
         if message.content.startswith("!") or message.content.startswith("/"):
             return
 
-        # Đang bị Discord chặn -> bỏ qua để không làm tình hình tệ hơn
+        # Đang bị Discord chặn -> bỏ qua (cũng tiết kiệm luôn quota Gemini)
         if is_discord_blocked():
             return
 
@@ -447,7 +587,6 @@ class ReimuBot(commands.Bot):
         if not (is_mentioned or name_called or is_rp_tagged):
             return
 
-        # Chống spam: mỗi người dùng cách nhau tối thiểu vài giây
         now = time.time()
         if now - user_last_request.get(message.author.id, 0) < USER_COOLDOWN_SECONDS:
             return
@@ -514,20 +653,16 @@ class ReimuBot(commands.Bot):
 
         async with SafeTyping(message.channel):
             try:
-                async with gemini_semaphore:
-                    reply_text = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
+                reply_text, ok = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
             except Exception as e:
                 print(f"❌ [LỖI GEMINI CHAT]: {type(e).__name__}: {str(e)[:300]}", flush=True)
-                await safe_reply(
-                    message,
-                    "⛩️ *Reimu ngáp dài buông chén trà.* Hòm công đức đông khách quá làm bùa chú nghẽn mạch rồi! Mau cúng tiền rồi lát nữa quay lại!",
-                )
-                return
+                reply_text, ok = MSG_QUOTA, False
 
-        role_tag = "Bố Han Seiki" if is_father else f"Người dùng {user_display_name}"
-        history.append({"role": "user", "text": f"[{role_tag}]: {clean_content}"})
-        history.append({"role": "model", "text": reply_text})
-        save_conversation_history(message.channel.id, message.author.id, history)
+        if ok:
+            role_tag = "Bố Han Seiki" if is_father else f"Người dùng {user_display_name}"
+            history.append({"role": "user", "text": f"[{role_tag}]: {clean_content}"})
+            history.append({"role": "model", "text": reply_text})
+            save_conversation_history(message.channel.id, message.author.id, history)
 
         await safe_reply(message, reply_text)
 
@@ -535,15 +670,9 @@ class ReimuBot(commands.Bot):
 # ==============================================================================
 # 7. KHỞI CHẠY BOT AN TOÀN (KHÔNG RESTART DỒN DẬP)
 # ==============================================================================
-INITIAL_LOGIN_BACKOFF = 300   # 5 phút
-MAX_LOGIN_BACKOFF = 1800      # 30 phút
-login_backoff = INITIAL_LOGIN_BACKOFF
-
-
 async def main():
     global login_backoff
 
-    # Trễ ngẫu nhiên khi khởi động để tránh nhiều instance cùng đăng nhập một lúc
     await asyncio.sleep(random.uniform(3, 10))
 
     while True:
