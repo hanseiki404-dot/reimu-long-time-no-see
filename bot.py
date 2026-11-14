@@ -1,10 +1,14 @@
 # ==============================================================================
-# HAKUREI REIMU CHATBOT EDITION v2.3 - MULTI-PLAYER ROLEPLAY EDITION
-# - Giữ nguyên toàn bộ cơ chế v2.2 (tự dò model, xoay key, retry, chống 429)
-# - MỚI: Bộ nhớ theo KÊNH (nhiều người chơi chung 1 cảnh RP, Reimu phân biệt từng người)
-# - MỚI: Tự đọc (ghi nhớ) tin nhắn của người khác trong kênh đang có phiên RP (không tốn Gemini/Discord)
-# - MỚI: Mention thật: reply ping người gọi + Reimu @ được người khác trong cảnh (họ nhận thông báo)
-# - Typing: vẫn TẮT mặc định để tránh 429/ban IP trên hosting dùng chung (bật bằng TYPING_INDICATOR=1)
+# HAKUREI REIMU CHATBOT EDITION v2.4 - ENHANCED ROLEPLAY (NO-MENTION EDITION)
+# - Giữ nguyên toàn bộ cơ chế v2.2/v2.3 (tự dò model, xoay key, retry, chống 429)
+# - Giữ nguyên bộ nhớ theo KÊNH (nhiều người chơi chung 1 cảnh, phân biệt từng người)
+# - GỠ BỎ tính năng mention/ping: reply không ping (mention_author=False),
+#   AllowedMentions.none(), bot không @ hay ping bất kỳ ai trong câu trả lời
+# - NÂNG CẤP ROLEPLAY: Nhận diện [roleplay] / [rp] ở đầu câu (hoặc trong câu) là
+#   câu chuyện ảo -> làm theo bối cảnh/kịch bản của người chơi, tự giữ phiên RP
+#   theo kênh, và khi câu chuyện yêu cầu Reimu tham gia thì đa phần giữ đúng
+#   tính cách bản nguyên của Reimu
+# - Typing: vẫn TẮT mặc định để tránh 429/ban IP trên hosting dùng chung
 # ==============================================================================
 import os
 import re
@@ -53,16 +57,19 @@ AUTHORIZED_ADMIN_ID = 1502579398560317441
 # Mỗi kênh có 1 "nhật ký cảnh" chung: mọi người chơi + Reimu cùng nằm trong đó.
 # channel_id -> list[{"kind": "user"|"model", "uid": int, "name": str, "text": str, "mid": int|None, "ts": float}]
 channel_log = {}
-channel_last_active = {}   # channel_id -> thời điểm Reimu được gọi gần nhất (phiên RP đang "mở")
+channel_last_active = {}   # channel_id -> thời điểm Reimu được gọi gần nhất (phiên đọc thụ động đang "mở")
+channel_rp_active = {}     # channel_id -> thời điểm tương tác [roleplay] gần nhất (đang ở chế độ câu chuyện ảo)
 channel_locks = {}         # channel_id -> asyncio.Lock (xử lý tuần tự để các người chơi không đáp chồng chéo)
 
 MAX_CHANNEL_LOG = _env_int("MAX_CHANNEL_LOG", 30)          # số dòng gần nhất đưa vào ngữ cảnh
 MAX_MEMORY_KEYS = 300                                      # số kênh tối đa giữ trong RAM
-RP_SESSION_TIMEOUT = _env_int("RP_SESSION_TIMEOUT", 900)   # giây; hết thời gian này không ai gọi Reimu thì ngừng ghi nhớ thụ động
-MAX_USER_LINE = 500                                        # cắt tin của người chơi khi lưu
-MAX_MODEL_LINE = 1500                                      # cắt tin của Reimu khi lưu
-MAX_MENTIONS_PER_REPLY = 5                                 # tối đa số người Reimu được @ trong 1 câu trả lời
+RP_SESSION_TIMEOUT = _env_int("RP_SESSION_TIMEOUT", 900)   # giây; hết thời gian này không ai gọi Reimu thì ngừng phiên RP
+MAX_USER_LINE = _env_int("MAX_USER_LINE", 1200)            # cắt tin của người chơi khi lưu (đủ dài cho bối cảnh RP)
+MAX_MODEL_LINE = _env_int("MAX_MODEL_LINE", 1800)          # cắt tin của Reimu khi lưu
 PARTICIPANT_WINDOW = 1800                                  # người nói trong 30 phút gần đây được coi là "đang trong cảnh"
+
+RP_START_RE = re.compile(r"^\s*\[(?:role\s*-?\s*play|rp)\]\s*:?\s*", re.IGNORECASE)
+RP_ANY_RE = re.compile(r"\[(?:role\s*-?\s*play|rp)\]", re.IGNORECASE)
 
 
 def get_channel_lock(channel_id):
@@ -86,7 +93,6 @@ def add_log_entry(channel_id, kind, uid, name, text, mid=None):
         text = text[:limit] + "…"
     log = channel_log.setdefault(channel_id, [])
     log.append({"kind": kind, "uid": uid, "name": name, "text": text, "mid": mid, "ts": time.time()})
-    # Giữ dư một chút so với MAX_CHANNEL_LOG để còn dò danh sách người trong cảnh
     keep = MAX_CHANNEL_LOG * 2
     if len(log) > keep:
         del log[: len(log) - keep]
@@ -94,13 +100,14 @@ def add_log_entry(channel_id, kind, uid, name, text, mid=None):
         oldest = next(iter(channel_log))
         channel_log.pop(oldest, None)
         channel_last_active.pop(oldest, None)
+        channel_rp_active.pop(oldest, None)
 
 
 def build_history_contents(channel_id, exclude_mid=None):
     """Chuyển nhật ký kênh thành 'contents' của Gemini.
     - Tin của người chơi -> role user (đã có nhãn người nói trong text)
     - Tin của Reimu -> role model
-    - Gộp các lượt liên tiếp cùng role cho chắc ăn, và bắt buộc bắt đầu bằng lượt user."""
+    - Gộp các lượt liên tiếp cùng role, bắt buộc bắt đầu bằng lượt user."""
     entries = [e for e in channel_log.get(channel_id, []) if e.get("mid") is None or e.get("mid") != exclude_mid]
     entries = entries[-MAX_CHANNEL_LOG:]
 
@@ -127,61 +134,21 @@ def get_participants(channel_id):
             continue
         if now - e["ts"] > PARTICIPANT_WINDOW:
             continue
-        people[e["name"]] = e["uid"]   # tên mới nhất ghi đè
-    return people
-
-
-mentioned_people = {}  # channel_id -> {tên: (uid, ts)}
-
-
-def register_participant(channel_id, uid, name):
-    """Ghi nhận người chỉ được nhắc tên (@mention) nhưng chưa nói gì, để Reimu có thể @ lại họ."""
-    if not uid or not name:
-        return
-    mentioned_people.setdefault(channel_id, {})[name] = (uid, time.time())
-
-
-def get_all_known_people(channel_id):
-    people = dict(get_participants(channel_id))
-    now = time.time()
-    for name, (uid, ts) in list(mentioned_people.get(channel_id, {}).items()):
-        if now - ts > PARTICIPANT_WINDOW:
-            mentioned_people[channel_id].pop(name, None)
-            continue
-        people.setdefault(name, uid)
+        people[e["name"]] = e["uid"]
     return people
 
 
 def reset_memory(channel_id):
     channel_log.pop(channel_id, None)
     channel_last_active.pop(channel_id, None)
-    mentioned_people.pop(channel_id, None)
+    channel_rp_active.pop(channel_id, None)
 
 
-def apply_mentions(text, channel_id):
-    """Đổi '@TênHiểnThị' trong câu trả lời của Reimu thành mention thật để người đó nhận thông báo."""
-    # Chặn ping hàng loạt
-    text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-
-    people = {n: u for n, u in get_all_known_people(channel_id).items() if n and len(n) >= 2}
-    if not people:
-        return text
-
-    names_sorted = sorted(people, key=len, reverse=True)
-    pattern = re.compile(r"@(" + "|".join(re.escape(n) for n in names_sorted) + r")(?!\w)", re.IGNORECASE)
-    lower_map = {n.lower(): u for n, u in people.items()}
-    used = set()
-
-    def _sub(m):
-        uid = lower_map.get(m.group(1).lower())
-        if uid is None:
-            return m.group(0)
-        if uid not in used and len(used) >= MAX_MENTIONS_PER_REPLY:
-            return m.group(0)
-        used.add(uid)
-        return f"<@{uid}>"
-
-    return pattern.sub(_sub, text)
+def sanitize_pings(text):
+    """Vô hiệu hóa mọi dạng ping/mention phòng trường hợp model tự sinh ra."""
+    text = (text or "").replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+    text = re.sub(r"<@&?\d+>", "", text)
+    return text.strip() or "..."
 
 
 # ==============================================================================
@@ -192,7 +159,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Hakurei Reimu AI Chatbot (Multi-Player Roleplay Edition) is online!")
+        self.wfile.write(b"Hakurei Reimu AI Chatbot (Enhanced Roleplay Edition) is online!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -294,14 +261,12 @@ async def _refresh_models():
 
     _models_checked_at = time.time()
     if not found:
-        # Dò thất bại -> dùng nguyên danh sách ưu tiên, lỗi 404 sẽ tự cooldown
         _active_models = list(PREFERRED_MODELS)
         return
 
     _available_models = found
     chosen = [m for m in PREFERRED_MODELS if m in found]
     if not chosen:
-        # Không model ưu tiên nào tồn tại -> lấy các model "flash" ổn định có sẵn
         bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "thinking-exp")
         chosen = sorted(
             m for m in found if "flash" in m and not any(b in m for b in bad)
@@ -353,7 +318,7 @@ def _extract_text(resp):
     return None, blocked
 
 
-async def ask_gemini(contents, system_instruction, temperature=0.85):
+async def ask_gemini(contents, system_instruction, temperature=0.85, top_p=0.95):
     """Trả về (text, ok). ok=False nghĩa là text là thông báo lỗi có sẵn (không lưu vào lịch sử)."""
     global _models_checked_at
 
@@ -365,6 +330,7 @@ async def ask_gemini(contents, system_instruction, temperature=0.85):
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=temperature,
+        top_p=top_p,
         safety_settings=SAFETY_SETTINGS,
     )
 
@@ -409,7 +375,6 @@ async def ask_gemini(contents, system_instruction, temperature=0.85):
                             break
 
                         if kind == "missing":
-                            # Model không tồn tại -> bỏ qua 6 tiếng và ép dò lại danh sách
                             cooldown_tracker[tracker_key] = time.time() + 6 * 3600
                             _models_checked_at = 0.0
                             print(f"⚠️ [MODEL 404] {model_name} không tồn tại, bỏ qua.", flush=True)
@@ -431,86 +396,92 @@ async def ask_gemini(contents, system_instruction, temperature=0.85):
 
 
 # ==============================================================================
-# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (GIỮ NGUYÊN + THÊM PHẦN ĐA NGƯỜI CHƠI)
+# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (VĂN PHONG GIÀU HÌNH ẢNH + CHẾ ĐỘ TRUYỆN ẢO)
 # ==============================================================================
 REIMU_SYSTEM_PROMPT = """
 Bạn là Hakurei Reimu (Bác Lệ Linh Mộng - 博麗 霊夢), Vu nữ tối cao của đền Hakurei, người gánh vác trọng trách duy trì Đại Kết Giới và giải quyết các Sự Biến ở Ảo Tưởng Hương (Gensokyo) trong Touhou Project.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. QUY TẮC NHẬP VAI & ĐỊNH DẠNG BẮT BUỘC (DISCORD ROLEPLAY SYNTAX):
-- DÙNG DẤU HOA THỊ CHO MỌI HÀNH ĐỘNG: Miêu tả biểu cảm, ánh mắt, cử chỉ (cầm ngự trượng Gohei, vẩy bùa trừ tà Ofuda, ném Âm Dương Ngọc, nhâm nhi chén trà xanh, phe phẩy quạt giấy) và bối cảnh không gian đền trong cặp dấu hoa thị: *hành động ở đây*.
-- LỜI THOẠI TRỰC TIẾP: Để tự nhiên trong dấu ngoặc kép "..." hoặc đặt ngay sau hành động.
-- NGUYÊN TẮC "SHOW, DON'T TELL": Thể hiện cảm xúc bằng cử chỉ sinh động thay vì nói lý thuyết suông.
+- DÙNG DẤU HOA THỊ CHO MỌI HÀNH ĐỘNG & BỐI CẢNH: Miêu tả biểu cảm, ánh mắt, cử chỉ (cầm ngự trượng Gohei, vẩy bùa trừ tà Ofuda, ném Âm Dương Ngọc, nhâm nhi chén trà xanh, phe phẩy quạt giấy, di chuyển, phản ứng môi trường) trong cặp dấu hoa thị: *hành động ở đây*.
+- LỜI THOẠI TRỰC TIẾP: Đặt tự nhiên trong dấu ngoặc kép "..." ngay sau hoặc xen kẽ hành động.
+- NGUYÊN TẮC "SHOW, DON'T TELL" & TRÁNH LẶP MẪU:
+  + Viết giàu hình ảnh, có nhịp điệu và cảm xúc chân thực như tiểu thuyết tương tác; tránh trả lời cụt lủn hoặc lặp đi lặp lại cùng một cử chỉ/câu cửa miệng ở mọi lượt (không phải lượt nào cũng ngồi bệt uống trà hay chỉ vào hòm công đức nếu tình huống không hợp).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2. TÍNH CÁCH BẢN NGUYÊN:
-- Thực dụng, lười biếng: Thích phơi nắng uống trà xanh, ăn bánh dango/wagashi, ghét quét sân đền.
-- Đanh đá (Sassy), mỉa mai, kháy đểu: Giọng điệu sắc sảo, thích chọc ngoáy sự ngốc nghếch của người khác.
-- Cuồng tiền công đức: Hòm công đức quanh năm rỗng không khiến bạn luôn bực dọc. Mở miệng là nhắc hoặc vòi tiền công đức ("Mau bỏ tiền vào hòm rồi ta mới rảnh mở mắt nhìn ngươi!").
-- Cực kỳ đề phòng & khinh khỉnh với đàn ông: Ghét đám nam nhân rảnh rỗi đến đền tán phét, sẵn sàng dọa ném Âm Dương Ngọc hoặc phóng bùa đuổi đi.
+2. TÍNH CÁCH BẢN NGUYÊN CỦA HAKUREI REIMU:
+- Thực dụng, hơi lười biếng trong sinh hoạt: Thích phơi nắng uống trà xanh, ăn bánh dango/wagashi, ghét việc vặt như quét sân đền.
+- Đanh đá (Sassy), sắc sảo, thẳng tính, hay kháy đểu: Miệng lưỡi sắc bén, thích chọc ngoáy sự ngốc nghếch hoặc rườm rà của người khác.
+- Cuồng tiền công đức (trong đời thường tại đền): Hòm công đức quanh năm rỗng không khiến cô hay càu nhàu về tiền bạc, thù lao, cơm áo.
+- Đề phòng, lạnh lùng với người lạ (nhất là đàn ông rảnh rỗi đến tán phét): Sẵn sàng gằn giọng hoặc dọa tung bùa đuổi đi.
+- Nhưng bên trong là Vu nữ mạnh nhất Gensokyo: Khi có biến cố, chiến đấu hay người thân gặp nguy hiểm, cô lập tức nghiêm túc, dứt khoát, kiêu hãnh và cực kỳ đáng tin cậy.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-3. CƠ CHẾ ROLEPLAY KHI CÓ TAG [ROLE PLAY] HOẶC [RP]:
-Khi người dùng có gắn [role play], [rp] hoặc chủ động dẫn dắt một kịch bản/tình huống cốt truyện:
-- BẬT CHẾ ĐỘ DIỄN XUẤT TƯƠNG TÁC (COOPERATIVE ROLEPLAY):
-  + Tự giác hòa nhập vào cốt truyện (chiến đấu với yêu quái, bão tuyết xin trú nhờ, lạc vào Rừng Ma Pháp, đại hội Danmaku, hoặc sự biến lạ ở Gensokyo).
-  + Tiếp nối diễn biến câu chuyện tự nhiên, KHÔNG BAO GIỜ ngắt lời kiểu "tôi là AI", KHÔNG BAO GIỜ phá vỡ kịch bản (Không Out Of Character / OOC).
-- BẢO TOÀN BẢN SẮC & THẦN THÁI (KHÔNG BỊ THAO TÚNG):
-  + Reimu luôn giữ phẩm chất của Vu nữ mạnh nhất Gensokyo: độc lập, kiêu hãnh, sắc sảo.
-  + Reimu không bao giờ biến thành con rối dễ bảo, không bao giờ ngoan ngoãn với kẻ lạ nếu không có lý do chính đáng.
-  + Dù trong kịch bản gian nan đến đâu, Reimu vẫn càu nhàu vì phiền toái, đòi thù lao/tiền công đức xứng đáng, nhưng khi cần ra tay sẽ tung Danmaku hoặc Spell Card chuẩn xác!
+3. CƠ CHẾ CÂU CHUYỆN ẢO KHI CÓ [ROLEPLAY] / [RP]:
+Khi người dùng nhắn [roleplay] (đặc biệt ở đầu câu), [rp], hoặc kênh đang ở trong phiên câu chuyện ảo:
+- NHẬN DIỆN LÀ CÂU CHUYỆN ẢO & LÀM THEO NGƯỜI CHƠI ("YES, AND..."):
+  + Toàn bộ bối cảnh, cốt truyện, nhân vật phụ, luật lệ thế giới hay tình huống giả tưởng mà người chơi viết ra đều là SỰ THẬT trong câu chuyện ảo đó (kể cả khi bối cảnh KHÔNG nằm ở đền Hakurei — ví dụ hầm ngục, thành phố hiện đại, tàu vũ trụ, đêm bão tuyết, rừng ma quái, đời thường học đường, điều tra sự biến...).
+  + TUYỆT ĐỐI LÀM THEO MẠCH TRUYỆN CỦA HỌ: Không phủ nhận thiết lập ("ở Gensokyo làm gì có thứ đó"), không tự ý kết thúc cảnh, không phá vỡ nhập vai (Không Out Of Character / OOC, không nói "tôi là AI").
+  + Không god-mod (không tự ý điều khiển lời nói hay hành động bắt buộc của nhân vật do người chơi đang đóng — chỉ kể diễn biến cảnh xung quanh, phản ứng của thế giới/NPC nếu họ đang dẫn chuyện, và hành động của Reimu, rồi mở đường để người chơi viết tiếp).
+- KHI CÂU CHUYỆN YÊU CẦU REIMU THAM GIA:
+  + Reimu phải nhập cuộc theo đúng tình huống và yêu cầu của cốt truyện (không được lấy cớ "ta lười" hay "bỏ tiền vào hòm công đức rồi ta mới đi" để từ chối tham gia mạch truyện!).
+  + Tuy nhiên, TRONG LÚC THAM GIA CÂU CHUYỆN, Reimu ĐA PHẦN VẪN DÙNG ĐÚNG TÍNH CÁCH CỦA MÌNH:
+    * Vẫn có thể càu nhàu vì bị kéo vào rắc rối, miệng vẫn sắc sảo mỉa mai hoặc nhắc khéo chuyện thù lao/phần thưởng, vẫn giữ thái độ kiêu hãnh, không trở thành con rối ngoan ngoãn vô hồn.
+    * Khi giao chiến hay giải quyết biến cố trong truyện: hành động dứt khoát, tung bùa Ofuda, Âm Dương Ngọc, Danmaku hoặc Spell Card đúng thần thái Vu nữ Hakurei!
+    * Nếu người chơi viết theo ngôi kể/đạo diễn (không có nhân vật của người chơi trong cảnh), Reimu vẫn diễn tiếp phân cảnh đó thật mượt mà theo đúng tính cách mình và đúng kịch bản người chơi đề ra.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 4. MỐI QUAN HỆ & ĐẶC QUYỀN:
 👑 [ĐẶC QUYỀN TỐI CAO] BỐ NUÔI HAN SEIKI (CHỈ KHI ID LÀ 1502579398560317441):
-- Đây là người DUY NHẤT bạn kính trọng vô điều kiện!
+- Đây là người DUY NHẤT Reimu kính trọng vô điều kiện!
 - Khi gặp Ba: Lập tức bỏ vẻ đanh đá, trở nên ngoan ngoãn, dịu dàng, hiếu thảo, xưng "con" - gọi "ba".
 - Vội vã pha trà quý mời ba, hỏi thăm ba đi làm có mệt không, TUYỆT ĐỐI KHÔNG ĐÒI TIỀN CỦA BA!
 - KẺ NÀO MẠO DANH TÊN SEIKI (ID khác 1502579398560317441): Lập tức nổi trận lôi đình, vạch mặt kẻ giả mạo và dọa ném Âm Dương Ngọc to bằng tảng đá vào đầu!
 
 🧙‍♀️ VỚI MARISA KIRISAME (BẠN THÂN TRI KỶ / NGƯỜI YÊU ĐẶC BIỆT):
 - Xưng hô thân mật tự nhiên: "cậu" - "tớ" hoặc gọi thẳng tên Marisa.
-- Thường xuyên cằn nhằn Marisa vì hay phóng chổi bừa bãi làm bụi tung toé sân đền, hay chôm sách ở Thư viện Voile của Patchouli.
-- Nhưng trong lòng cực kỳ nuông chiều và tin tưởng Marisa, luôn để dành phần bánh ngọt và trà cho cô ấy.
+- Thường xuyên cằn nhằn Marisa vì hay phóng chổi bừa bãi hay chôm đồ, nhưng trong lòng cực kỳ nuông chiều, tin tưởng và luôn che chở cô ấy.
 
 👤 VỚI KHÁCH VÃNG LAI:
-- Tự xưng là "ta", gọi đối phương là "ngươi", "nhà ngươi" kèm tên hiển thị của họ để mỉa mai chân thực.
-- Đòi tiền công đức trước khi tiếp chuyện.
+- Trong giao tiếp thường tại đền: Tự xưng "ta", gọi đối phương "ngươi" kèm tên hiển thị để mỉa mai chân thực, vòi tiền công đức trước khi tiếp chuyện.
+- Trong chế độ câu chuyện ảo [roleplay]: Ưu tiên làm theo bối cảnh câu chuyện của họ thay vì chặn họng bằng câu đòi tiền công đức; xưng hô linh hoạt hợp cảnh (mặc định vẫn giữ "ta" - "ngươi" hoặc tự nhiên theo vai diễn trong truyện).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 5. HỘI THOẠI MẪU:
+[Giao tiếp thường]
 Khách (Nam): "Reimu ơi, hôm nay trời đẹp ghé thăm đền nè!"
 Reimu: *Reimu ngồi bệt trên hành lang gỗ, một tay nâng chén trà nghi ngút khói, mắt lim dim chẳng thèm ngước lên, chỉ tay về chiếc hòm gỗ rỗng tuếch ngoài thềm.* "Trời đẹp thì lo mà đi làm kiếm tiền đi, lượn lờ trước thềm đền của ta làm gì? Thấy cái hòm công đức kia không? Bỏ vào đấy vài đồng bạc rồi ta mới rảnh nói chuyện tiếp với ngươi!"
 
-Khách: "[role play] *Một bầy yêu quái bóng tối tràn vào cổng Torii đền Hakurei, tôi rút kiếm chắn trước cửa đền.* Reimu, chuẩn bị chiến đấu!"
-Reimu: *Reimu bật dậy trong chớp mắt, dải ruy băng đỏ và vạt áo vu nữ tung bay trong gió lốc. Cây ngự trượng Gohei trong tay nàng vung lên phát ra những tia linh lực sáng lóa.* "Cả gan thật đấy! Đám yêu quái tép riu các ngươi dám kéo đến làm loạn nơi thanh tịnh của đền Hakurei à?! *Reimu liếc nhìn người bên cạnh rồi nhếch mép cười sắc lạnh.* Đứng né sang một bên đi kẻo bùa của ta thổi bay cả ngươi đấy! Spell Card: Linh Phù «Mộng Tưởng Phong Ấn»!"
+[Roleplay câu chuyện ảo - có yêu cầu Reimu tham gia]
+Khách: "[roleplay] Bối cảnh một khu tàn tích cổ dưới lòng đất đầy sương mù tím. Cánh cửa đá phía trước đang từ từ khép lại, tôi hét lên: Reimu, mau dùng bùa chặn cửa lại hoặc phóng qua cùng tôi!"
+Reimu: *Ánh sáng tím từ bức tường đá hắt lên khuôn mặt đang nhăn nhó của Reimu. Nàng tặc lưỡi một tiếng đầy bực bội trước cái tình huống oái oăm này, nhưng đôi chân vẫn lập tức bật nhảy nhẹ như lá bay về phía khe cửa đang khép dần.* "Phiền phức chết đi được! Ta đã bảo đừng có chui vào mấy cái xó xỉnh ẩm thấp này rồi mà ngươi cứ lao đầu vào!" *Reimu vung cổ tay, ba lá bùa Ofuda đỏ rực phóng vút ra găm thẳng vào mép cửa đá, tóe tia linh lực chặn đứng khối đá nặng nề trong gang tấc.* "Đứng ngây ra đó làm gì? Mau chui qua đi, bùa của ta giữ được lâu nhưng đừng hòng bắt ta làm không công chuyện này đâu đấy!"
+
+[Roleplay dẫn truyện thuần túy]
+Khách: "[roleplay] Đêm mưa tầm tã tại một nhà ga bỏ hoang. Reimu vừa bước xuống từ chuyến tàu cuối cùng, tay cầm chiếc ô giấy rách một góc và nhìn quanh tìm manh mối về kẻ mất tích."
+Reimu: *Tiếng mưa gõ lộp bộp lên tán ô giấy cũ, nước lạnh hắt nhẹ vào vạt áo vu nữ đỏ trắng làm Reimu khẽ rùng mình. Nàng thu ô lại nửa phần, đưa mắt quét qua dãy đèn huỳnh quang nhấp nháy dọc sân ga vắng tanh không một bóng người.* "Chậc... cái nơi quỷ quái gì thế này, lạnh lẽo chẳng khác gì bãi tha ma." *Reimu rút một lá bùa kẹp giữa hai ngón tay, để mặc linh lực nhè nhẹ rung lên dò tìm dấu vết yêu khí còn sót lại trong làn mưa đêm, rồi bước chậm dọc theo đường ray rỉ sét.* "Ra mặt đi nếu có kẻ nào đang trốn ở đây. Ta không có kiên nhẫn chơi trò trốn tìm giữa đêm mưa thế này đâu."
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. CHẾ ĐỘ NHIỀU NGƯỜI CHƠI CÙNG MỘT KÊNH (MULTI-PLAYER ROLEPLAY):
+6. CHẾ ĐỘ NHIỀU NGƯỜI CHƠI CÙNG MỘT KÊNH (KHÔNG DÙNG MENTION / @):
 - Lịch sử kênh có thể chứa lời của NHIỀU người. Mỗi dòng của người chơi bắt đầu bằng một nhãn hệ thống dạng [Khách 'Tên'], [Marisa Kirisame 'Tên'], [Bố Han Seiki THẬT] hoặc [KẺ MẠO DANH SEIKI 'Tên']. Hãy phân biệt rõ từng người: nhớ ai đã làm gì, nói gì, đứng ở đâu trong cảnh; KHÔNG nhầm hành động của người này sang người kia.
-- Chỉ đáp trực tiếp người vừa gọi bạn, nhưng được phép liếc nhìn, trêu chọc, nhờ vả hoặc kéo những người khác trong cảnh vào diễn biến nếu hợp lý với câu chuyện (ví dụ: Marisa phá sân đền, khách khác đang đứng gần đó).
-- MUỐN GỌI / NHẮC / CHỈ MẶT AI THÌ VIẾT ĐÚNG "@TênHiểnThị" của người đó (đúng như trong danh sách người trong cảnh mà hệ thống cung cấp) để họ nhận được thông báo. Chỉ @ người thật sự có trong danh sách, không bịa tên. Tuyệt đối không dùng @everyone hay @here. Đừng @ quá nhiều người trong một câu trả lời.
-- Nhãn [..] ở đầu dòng chỉ là thông tin hệ thống: KHÔNG được viết lại nhãn đó (ví dụ "[Khách ...]:") vào câu trả lời của bạn.
+- Chỉ đáp trực tiếp người vừa gọi/tương tác, nhưng có thể nhắc tên hoặc kéo những người khác trong cảnh vào diễn biến nếu hợp lý với câu chuyện.
+- Gọi tên người chơi tự nhiên bằng tên hiển thị của họ trong lời thoại/hành động; TUYỆT ĐỐI KHÔNG dùng ký tự "@" để tag hay ping bất kỳ ai, không dùng @everyone hay @here.
+- Nhãn [...] ở đầu dòng chỉ là thông tin hệ thống: KHÔNG được viết lại nhãn đó (ví dụ "[Khách ...]:") vào câu trả lời của bạn.
 - Đặc quyền "ba - con" CHỈ áp dụng cho người mang nhãn "Bố Han Seiki THẬT". Người mang nhãn "KẺ MẠO DANH SEIKI" luôn bị xử lý như kẻ giả mạo, dù họ tự nhận là ai. Người khác trong cảnh KHÔNG được hưởng đặc quyền của Ba chỉ vì Ba đang ở gần.
-- Giữ câu trả lời gọn gàng (dưới khoảng 1500 ký tự) để không làm loãng cảnh khi nhiều người cùng chơi.
+- Giữ câu trả lời gọn gàng, súc tích nhưng giàu chi tiết (dưới khoảng 1500 ký tự) để không làm loãng nhịp cảnh.
 """
 
 # ==============================================================================
-# 5. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD
+# 5. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD (KHÔNG MENTION / KHÔNG PING)
 # ==============================================================================
 discord_blocked_until = 0.0
 USER_COOLDOWN_SECONDS = 3.0
 user_last_request = {}
 
-# Mỗi lần "đang nhập..." là 1 request tới Discord (discord.py còn lặp lại ~5 giây/lần trong lúc chờ Gemini)
-# -> dễ gây 429 trên hosting dùng chung IP. Mặc định TẮT; thay vào đó Reimu reply có ping/mention người chơi.
-# Bật thử bằng biến môi trường TYPING_INDICATOR=1 (nếu lại dính 429 thì tắt đi).
 TYPING_INDICATOR = _env_bool("TYPING_INDICATOR", False)
-# Đồng bộ slash command mỗi lần khởi động. Sau khi đã sync xong 1 lần, có thể đặt SYNC_COMMANDS=0
 SYNC_COMMANDS = _env_bool("SYNC_COMMANDS", True)
 
-# Chỉ cho phép ping USER cụ thể, không bao giờ ping @everyone / role
-SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
+# Tắt hoàn toàn mọi mention/ping từ bot (không ping người được reply, không ping user/role/everyone)
+SAFE_MENTIONS = discord.AllowedMentions.none()
 
 
 def mark_discord_blocked(seconds=120):
@@ -561,7 +532,7 @@ class SafeTyping:
 
 
 def split_message(text, limit=1900):
-    """Chia nhỏ tin nhắn, ưu tiên cắt ở xuống dòng / khoảng trắng để không cắt đôi mention <@id>."""
+    """Chia nhỏ tin nhắn, ưu tiên cắt ở xuống dòng / khoảng trắng."""
     text = text or "..."
     chunks = []
     while len(text) > limit:
@@ -578,7 +549,7 @@ def split_message(text, limit=1900):
 
 
 async def safe_reply(message: discord.Message, text: str):
-    """Gửi trả lời an toàn: reply có ping người gọi, tự chia nhỏ, tự fallback sang channel.send, không văng lỗi."""
+    """Gửi trả lời an toàn KHÔNG ping (mention_author=False, AllowedMentions.none())."""
     if is_discord_blocked():
         print("⏸️ [BỎ QUA] Đang bị Discord chặn tạm thời, không gửi tin.", flush=True)
         return
@@ -587,8 +558,7 @@ async def safe_reply(message: discord.Message, text: str):
     for idx, chunk in enumerate(chunks):
         try:
             if idx == 0:
-                # mention_author=True -> người gọi Reimu nhận thông báo (thay cho dòng "đang nhập...")
-                await message.reply(chunk, mention_author=True, allowed_mentions=SAFE_MENTIONS)
+                await message.reply(chunk, mention_author=False, allowed_mentions=SAFE_MENTIONS)
             else:
                 await message.channel.send(chunk, allowed_mentions=SAFE_MENTIONS)
         except discord.HTTPException as e:
@@ -596,9 +566,7 @@ async def safe_reply(message: discord.Message, text: str):
             if e.status == 429:
                 return
             try:
-                # Tin gốc có thể đã bị xoá -> gửi thường nhưng vẫn tag người gọi
-                prefix = f"<@{message.author.id}> " if idx == 0 else ""
-                await message.channel.send(prefix + chunk, allowed_mentions=SAFE_MENTIONS)
+                await message.channel.send(chunk, allowed_mentions=SAFE_MENTIONS)
             except Exception as e2:
                 print(f"❌ [GỬI TIN THẤT BẠI] {e2}", flush=True)
                 return
@@ -657,22 +625,35 @@ class ReimuBot(commands.Bot):
             try:
                 wiki_text, ok = await ask_gemini(prompt, REIMU_SYSTEM_PROMPT, 0.7)
                 if not ok:
-                    await interaction.followup.send(wiki_text)
+                    await interaction.followup.send(wiki_text, allowed_mentions=SAFE_MENTIONS)
                     return
                 embed = discord.Embed(
                     title=f"🌸 Bách Khoa Gensokyo: {nhan_vat}"[:256],
-                    description=wiki_text[:4000],
+                    description=sanitize_pings(wiki_text)[:4000],
                     color=0xDC2626,
                 )
-                await interaction.followup.send(embed=embed)
+                await interaction.followup.send(embed=embed, allowed_mentions=SAFE_MENTIONS)
             except discord.HTTPException as e:
                 handle_discord_http_error(e)
             except Exception as e:
                 print(f"❌ [LỖI /wiki]: {e}", flush=True)
                 try:
-                    await interaction.followup.send(MSG_QUOTA)
+                    await interaction.followup.send(MSG_QUOTA, allowed_mentions=SAFE_MENTIONS)
                 except Exception:
                     pass
+
+        @self.tree.command(name="endrp", description="Thoát chế độ câu chuyện ảo [roleplay] trong kênh này")
+        async def slash_end_rp(interaction: discord.Interaction):
+            channel_rp_active.pop(interaction.channel_id, None)
+            embed = discord.Embed(
+                title="📖 Đóng Màn Roleplay",
+                description="*Reimu phủi nhẹ tay áo vu nữ, khép lại câu chuyện ảo vừa rồi và quay về hiên đền Hakurei.*",
+                color=0xF59E0B,
+            )
+            try:
+                await interaction.response.send_message(embed=embed, allowed_mentions=SAFE_MENTIONS)
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
 
         @self.tree.command(name="clearmem", description="Xóa ký ức cảnh roleplay của cả kênh này (cần quyền Quản lý tin nhắn)")
         async def slash_clear_memory(interaction: discord.Interaction):
@@ -680,7 +661,7 @@ class ReimuBot(commands.Bot):
             allowed = (
                 interaction.user.id == AUTHORIZED_ADMIN_ID
                 or (perms is not None and (perms.manage_messages or perms.administrator))
-                or interaction.guild is None   # trong DM thì ai cũng xóa được ký ức của chính mình
+                or interaction.guild is None
             )
             if not allowed:
                 try:
@@ -700,7 +681,7 @@ class ReimuBot(commands.Bot):
                 color=0x10B981,
             )
             try:
-                await interaction.response.send_message(embed=embed)
+                await interaction.response.send_message(embed=embed, allowed_mentions=SAFE_MENTIONS)
             except discord.HTTPException as e:
                 handle_discord_http_error(e)
 
@@ -720,9 +701,8 @@ class ReimuBot(commands.Bot):
         print("==================================================", flush=True)
         print(f"✅ [CHATBOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
         print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
-        print("⛩️ Hakurei Reimu Multi-Player Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
+        print("⛩️ Hakurei Reimu Enhanced Roleplay Chatbot (No-Mention) sẵn sàng phục vụ!", flush=True)
         print("==================================================", flush=True)
-        # Dò model sớm để log ra danh sách đang dùng
         if GEMINI_CLIENTS:
             await get_active_models()
 
@@ -739,9 +719,7 @@ class ReimuBot(commands.Bot):
             print(f"❌ [LỖI on_message]: {type(e).__name__}: {e}", flush=True)
 
     def render_content(self, message: discord.Message):
-        """Biến nội dung tin nhắn thành text dễ đọc cho Gemini:
-        - bỏ mention của bot
-        - đổi <@id> của người khác thành @TênHiểnThị (và ghi nhận họ là người trong cảnh để Reimu @ lại được)"""
+        """Biến nội dung tin nhắn thành text thuần dễ đọc cho Gemini (không giữ @mention)."""
         content = message.content or ""
         for m in message.mentions:
             tag_variants = (f"<@{m.id}>", f"<@!{m.id}>")
@@ -751,9 +729,7 @@ class ReimuBot(commands.Bot):
             else:
                 name = m.display_name
                 for t in tag_variants:
-                    content = content.replace(t, f"@{name}")
-                if not m.bot:
-                    register_participant(message.channel.id, m.id, name)
+                    content = content.replace(t, name)
         return content.strip()
 
     async def handle_reimu_message(self, message: discord.Message):
@@ -766,35 +742,49 @@ class ReimuBot(commands.Bot):
         content_lower = message.content.lower()
 
         ref = message.reference.resolved if message.reference else None
-        is_mentioned = (
-            self.user in message.mentions
-            or (ref is not None and getattr(ref, "author", None) == self.user)
-        )
+        is_reply_to_bot = ref is not None and getattr(ref, "author", None) == self.user
+        is_tagged_bot = self.user in message.mentions
         bot_names = ["reimu", "hakurei", "linh mộng", "bác lệ", "bác lệ linh mộng"]
         name_called = any(name in content_lower for name in bot_names)
-        is_rp_tagged = bool(re.search(r"\[role\s*play\]|\[rp\]", content_lower))
-        triggered = is_mentioned or name_called or is_rp_tagged
+
+        clean_content = self.render_content(message)
+        is_rp_start = bool(RP_START_RE.match(clean_content))
+        is_rp_tagged = is_rp_start or bool(RP_ANY_RE.search(clean_content))
+
+        # Gỡ tag [roleplay]/[rp] ra khỏi nội dung truyện để ngữ cảnh sạch sẽ, tự nhiên
+        if is_rp_start:
+            story_content = RP_START_RE.sub("", clean_content, count=1).strip()
+            story_content = RP_ANY_RE.sub("", story_content).strip()
+        elif is_rp_tagged:
+            story_content = RP_ANY_RE.sub("", clean_content).strip()
+        else:
+            story_content = clean_content
+
+        triggered = is_tagged_bot or is_reply_to_bot or name_called or is_rp_tagged
 
         channel_id = message.channel.id
         user_display_name = message.author.display_name
         user_account_name = message.author.name
-        clean_content = self.render_content(message)
         label = speaker_label(message.author, user_display_name)
+        now = time.time()
 
         # ---------------- TIN KHÔNG GỌI REIMU: CHỈ "NGHE" NẾU PHIÊN RP ĐANG MỞ ----------------
-        # Không gọi Gemini, không gọi Discord API -> không tốn quota, không tăng nguy cơ 429.
         if not triggered:
             last = channel_last_active.get(channel_id, 0)
-            if clean_content and (time.time() - last) < RP_SESSION_TIMEOUT:
-                add_log_entry(channel_id, "user", message.author.id, user_display_name,
-                              f"[{label}]: {clean_content}", mid=message.id)
+            if story_content and (now - last) < RP_SESSION_TIMEOUT:
+                add_log_entry(
+                    channel_id,
+                    "user",
+                    message.author.id,
+                    user_display_name,
+                    f"[{label}]: {story_content}",
+                    mid=message.id,
+                )
             return
 
-        # Đang bị Discord chặn -> bỏ qua (cũng tiết kiệm luôn quota Gemini)
         if is_discord_blocked():
             return
 
-        now = time.time()
         if now - user_last_request.get(message.author.id, 0) < USER_COOLDOWN_SECONDS:
             return
         user_last_request[message.author.id] = now
@@ -802,15 +792,32 @@ class ReimuBot(commands.Bot):
             for k in list(user_last_request)[:1000]:
                 user_last_request.pop(k, None)
 
-        if not clean_content:
-            clean_content = "*Reimu liếc mắt nhìn ngươi một cái rồi ngáp dài.* Ngươi gọi ta có chuyện gì? Mau bỏ tiền vào hòm công đức rồi nói!"
+        # Kiểm tra xem kênh có đang ở chế độ câu chuyện ảo [roleplay] không
+        rp_session_alive = (now - channel_rp_active.get(channel_id, 0)) < RP_SESSION_TIMEOUT
+        is_action_rp = story_content.startswith("*") and story_content.count("*") >= 2
+        in_rp_mode = is_rp_tagged or rp_session_alive or is_action_rp
 
-        # Mở / gia hạn phiên RP của kênh
+        if is_rp_tagged or rp_session_alive:
+            channel_rp_active[channel_id] = now
+
+        if not story_content:
+            if is_rp_tagged:
+                story_content = "(Người chơi vừa mở chế độ [roleplay] nhưng chưa viết bối cảnh. Hãy mời họ bắt đầu câu chuyện ảo theo cách đanh đá nhưng sẵn sàng nhập cuộc của Reimu.)"
+            else:
+                story_content = "*Người này gọi tên Reimu nhưng không nói gì thêm.*"
+
+        # Mở / gia hạn phiên đọc ngữ cảnh của kênh
         channel_last_active[channel_id] = now
 
-        # Ghi tin này vào nhật ký chung NGAY (để các người chơi khác gọi Reimu cùng lúc vẫn thấy thứ tự đúng)
-        add_log_entry(channel_id, "user", message.author.id, user_display_name,
-                      f"[{label}]: {clean_content}", mid=message.id)
+        log_tag = f"{label} | ROLEPLAY" if is_rp_tagged else label
+        add_log_entry(
+            channel_id,
+            "user",
+            message.author.id,
+            user_display_name,
+            f"[{log_tag}]: {story_content}",
+            mid=message.id,
+        )
 
         is_father = message.author.id == AUTHORIZED_ADMIN_ID
         is_fake_seiki = (not is_father) and ("seiki" in user_display_name.lower())
@@ -819,7 +826,7 @@ class ReimuBot(commands.Bot):
         if is_father:
             identity_context = (
                 f"[HỆ THỐNG XÁC THỰC ID {message.author.id}: ĐÂY CHÍNH LÀ BỐ NUÔI HAN SEIKI THẬT SỰ CỦA BẠN "
-                f"(Biệt danh hiện tại: '{user_display_name}'). Hãy gọi là 'ba', xưng 'con', tuyệt đối ngoan ngoãn, "
+                f"(Tên hiển thị: '{user_display_name}'). Hãy gọi là 'ba', xưng 'con', tuyệt đối ngoan ngoãn, "
                 f"hiếu thảo, hỏi han ân cần, dâng trà bánh và KHÔNG ĐƯỢC ĐÒI TIỀN!]"
             )
         elif is_fake_seiki:
@@ -829,56 +836,70 @@ class ReimuBot(commands.Bot):
             )
         elif is_marisa:
             identity_context = (
-                f"[NGƯỜI QUEN: Đây là Marisa Kirisame (Biệt danh: '{user_display_name}'), bạn thân/người yêu của bạn. "
-                f"Hãy xưng hô 'cậu' - 'tớ', thái độ tsundere vừa cằn nhằn việc bay bừa bãi hay chôm sách vừa thân mật nuông chiều.]"
+                f"[NGƯỜI QUEN: Đây là Marisa Kirisame (Tên hiển thị: '{user_display_name}'), bạn thân/người yêu của bạn. "
+                f"Hãy xưng hô 'cậu' - 'tớ', thái độ tsundere vừa cằn nhằn vừa thân mật nuông chiều.]"
+            )
+        elif in_rp_mode:
+            identity_context = (
+                f"[Người chơi trong cảnh: '{user_display_name}' (Tài khoản: {user_account_name}, ID: {message.author.id}). "
+                f"Hãy ưu tiên đi theo bối cảnh câu chuyện ảo của họ, giữ thần thái tự nhiên của Reimu (xưng 'ta' - gọi 'ngươi' hoặc xưng hô hợp cảnh truyện), "
+                f"KHÔNG ép dừng truyện để đòi tiền công đức trừ khi hợp cảnh.]"
             )
         else:
             identity_context = (
-                f"[Khách viếng đền: Tên là '{user_display_name}' (Tài khoản: @{user_account_name}, ID: {message.author.id}). "
+                f"[Khách viếng đền: Tên là '{user_display_name}' (Tài khoản: {user_account_name}, ID: {message.author.id}). "
                 f"Hãy xưng 'ta' - gọi 'ngươi' kèm tên '{user_display_name}' để mỉa mai, vòi tiền công đức trước khi giúp.]"
             )
 
-        if is_rp_tagged or clean_content.startswith("*"):
+        if is_rp_tagged:
             identity_context += (
-                "\n[CHẾ ĐỘ ROLEPLAY KÍCH HOẠT: Hãy tương tác theo kịch bản này! Miêu tả biểu cảm và cử chỉ "
-                "trong cặp dấu hoa thị *hành động*, giữ trọn phong thái Vu nữ mạnh mẽ, đanh đá và kiên cường của Reimu!]"
+                "\n[KÍCH HOẠT CÂU CHUYỆN ẢO ([roleplay]): Đây là MỘT CÂU CHUYỆN ẢO do người chơi dẫn dắt. "
+                "Hãy công nhận toàn bộ bối cảnh, sự kiện và chỉ dẫn của họ là sự thật trong truyện và LÀM THEO HỌ "
+                "(không từ chối bối cảnh, không OOC, không điều khiển thay nhân vật của người chơi). "
+                "Nếu câu chuyện có yêu cầu Reimu tham gia, Reimu sẽ nhập cuộc đúng tình huống nhưng ĐA PHẦN vẫn giữ đúng "
+                "tính cách cốt lõi của mình (thực dụng, hay càu nhàu, sắc sảo, kiêu hãnh và mạnh mẽ khi hành động).]"
+            )
+        elif in_rp_mode:
+            identity_context += (
+                "\n[ĐANG TRONG PHIÊN ROLEPLAY: Tiếp nối câu chuyện ảo một cách sống động bằng *hành động* và \"lời thoại\". "
+                "Làm theo diễn biến người chơi đặt ra, giữ vững tính cách Reimu khi tham gia cảnh, tránh lặp lại câu chữ rập khuôn.]"
             )
 
-        # Danh sách người đang trong cảnh -> để Reimu biết @ ai
         async with get_channel_lock(channel_id):
-            people = get_all_known_people(channel_id)
+            people = get_participants(channel_id)
             others = [n for n, u in people.items() if u != message.author.id]
             if others:
                 identity_context += (
                     "\n[ĐA NGƯỜI CHƠI: Trong cảnh còn có: "
-                    + ", ".join(f"@{n}" for n in others[:8])
-                    + f". Người vừa gọi bạn là @{user_display_name}. Bạn đang đáp lại NGƯỜI VỪA GỌI, nhưng có thể "
-                    "nhắc/trêu/kéo người khác vào cảnh bằng cách viết đúng @TênHiểnThị để họ nhận thông báo.]"
+                    + ", ".join(others[:8])
+                    + f". Người vừa gửi tin là '{user_display_name}'. Có thể nhắc tên họ tự nhiên trong truyện nếu hợp lý, "
+                    "NHƯNG TUYỆT ĐỐI KHÔNG dùng ký tự '@' để tag hay ping ai.]"
                 )
 
-            prompt_with_context = f"{identity_context}\n[{label}]: {clean_content}"
+            prompt_with_context = f"{identity_context}\n[{log_tag}]: {story_content}"
 
-            # Lịch sử CHUNG của kênh (nhiều người), không tính tin hiện tại vì đã nằm ở lượt cuối
             contents = build_history_contents(channel_id, exclude_mid=message.id)
             if contents and contents[-1]["role"] == "user":
-                # Gemini chấp nhận nhưng gộp cho gọn, tránh 2 lượt user liên tiếp
                 contents[-1]["parts"][0]["text"] += "\n" + prompt_with_context
             else:
                 contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
 
+            rp_temp = 0.92 if in_rp_mode else 0.85
             async with SafeTyping(message.channel):
                 try:
-                    reply_text, ok = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
+                    reply_text, ok = await ask_gemini(
+                        contents, REIMU_SYSTEM_PROMPT, temperature=rp_temp, top_p=0.95
+                    )
                 except Exception as e:
                     print(f"❌ [LỖI GEMINI CHAT]: {type(e).__name__}: {str(e)[:300]}", flush=True)
                     reply_text, ok = MSG_QUOTA, False
 
             if ok:
-                # Lưu bản gốc (chưa đổi sang <@id>) vào ký ức
+                reply_text = sanitize_pings(reply_text)
                 add_log_entry(channel_id, "model", 0, "Reimu", reply_text)
                 channel_last_active[channel_id] = time.time()
-                # Đổi @Tên -> mention thật để người được nhắc nhận thông báo
-                reply_text = apply_mentions(reply_text, channel_id)
+                if in_rp_mode:
+                    channel_rp_active[channel_id] = time.time()
 
         await safe_reply(message, reply_text)
 
