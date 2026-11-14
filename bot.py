@@ -1,8 +1,10 @@
 # ==============================================================================
-# HAKUREI REIMU CHATBOT EDITION v2.2 - MASTER ROLEPLAY EDITION
-# - Tự dò model Gemini còn tồn tại (hết lỗi 404 NOT_FOUND)
-# - Dùng client async (aio) + timeout + retry theo từng model/key
-# - Giảm tối đa số request gửi tới Discord để tránh 429
+# HAKUREI REIMU CHATBOT EDITION v2.3 - MULTI-PLAYER ROLEPLAY EDITION
+# - Giữ nguyên toàn bộ cơ chế v2.2 (tự dò model, xoay key, retry, chống 429)
+# - MỚI: Bộ nhớ theo KÊNH (nhiều người chơi chung 1 cảnh RP, Reimu phân biệt từng người)
+# - MỚI: Tự đọc (ghi nhớ) tin nhắn của người khác trong kênh đang có phiên RP (không tốn Gemini/Discord)
+# - MỚI: Mention thật: reply ping người gọi + Reimu @ được người khác trong cảnh (họ nhận thông báo)
+# - Typing: vẫn TẮT mặc định để tránh 429/ban IP trên hosting dùng chung (bật bằng TYPING_INDICATOR=1)
 # ==============================================================================
 import os
 import re
@@ -44,36 +46,142 @@ def _env_bool(name, default=False):
 
 
 # ==============================================================================
-# 1. CẤU HÌNH ID BỐ NUÔI HAN SEIKI / ADMIN & BỘ NHỚ RAM
+# 1. CẤU HÌNH ID BỐ NUÔI HAN SEIKI / ADMIN & BỘ NHỚ KÊNH (ĐA NGƯỜI CHƠI)
 # ==============================================================================
 AUTHORIZED_ADMIN_ID = 1502579398560317441
 
-chat_memory = {}
-MAX_HISTORY = 10
-MAX_MEMORY_KEYS = 500
+# Mỗi kênh có 1 "nhật ký cảnh" chung: mọi người chơi + Reimu cùng nằm trong đó.
+# channel_id -> list[{"kind": "user"|"model", "uid": int, "name": str, "text": str, "mid": int|None, "ts": float}]
+channel_log = {}
+channel_last_active = {}   # channel_id -> thời điểm Reimu được gọi gần nhất (phiên RP đang "mở")
+channel_locks = {}         # channel_id -> asyncio.Lock (xử lý tuần tự để các người chơi không đáp chồng chéo)
+
+MAX_CHANNEL_LOG = _env_int("MAX_CHANNEL_LOG", 30)          # số dòng gần nhất đưa vào ngữ cảnh
+MAX_MEMORY_KEYS = 300                                      # số kênh tối đa giữ trong RAM
+RP_SESSION_TIMEOUT = _env_int("RP_SESSION_TIMEOUT", 900)   # giây; hết thời gian này không ai gọi Reimu thì ngừng ghi nhớ thụ động
+MAX_USER_LINE = 500                                        # cắt tin của người chơi khi lưu
+MAX_MODEL_LINE = 1500                                      # cắt tin của Reimu khi lưu
+MAX_MENTIONS_PER_REPLY = 5                                 # tối đa số người Reimu được @ trong 1 câu trả lời
+PARTICIPANT_WINDOW = 1800                                  # người nói trong 30 phút gần đây được coi là "đang trong cảnh"
 
 
-def get_history_key(channel_id, user_id):
-    return f"{channel_id}_{user_id}"
+def get_channel_lock(channel_id):
+    lock = channel_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        channel_locks[channel_id] = lock
+        if len(channel_locks) > 1000:
+            for k in list(channel_locks)[:500]:
+                if not channel_locks[k].locked():
+                    channel_locks.pop(k, None)
+    return lock
 
 
-def get_conversation_history(channel_id, user_id):
-    return list(chat_memory.get(get_history_key(channel_id, user_id), []))
+def add_log_entry(channel_id, kind, uid, name, text, mid=None):
+    text = (text or "").strip()
+    if not text:
+        return
+    limit = MAX_MODEL_LINE if kind == "model" else MAX_USER_LINE
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    log = channel_log.setdefault(channel_id, [])
+    log.append({"kind": kind, "uid": uid, "name": name, "text": text, "mid": mid, "ts": time.time()})
+    # Giữ dư một chút so với MAX_CHANNEL_LOG để còn dò danh sách người trong cảnh
+    keep = MAX_CHANNEL_LOG * 2
+    if len(log) > keep:
+        del log[: len(log) - keep]
+    while len(channel_log) > MAX_MEMORY_KEYS:
+        oldest = next(iter(channel_log))
+        channel_log.pop(oldest, None)
+        channel_last_active.pop(oldest, None)
 
 
-def save_conversation_history(channel_id, user_id, history_list):
-    key = get_history_key(channel_id, user_id)
-    trimmed = history_list[-MAX_HISTORY:]
-    # Gemini cần lịch sử bắt đầu bằng lượt của "user"
-    while trimmed and trimmed[0].get("role") != "user":
-        trimmed.pop(0)
-    chat_memory[key] = trimmed
-    while len(chat_memory) > MAX_MEMORY_KEYS:
-        chat_memory.pop(next(iter(chat_memory)), None)
+def build_history_contents(channel_id, exclude_mid=None):
+    """Chuyển nhật ký kênh thành 'contents' của Gemini.
+    - Tin của người chơi -> role user (đã có nhãn người nói trong text)
+    - Tin của Reimu -> role model
+    - Gộp các lượt liên tiếp cùng role cho chắc ăn, và bắt buộc bắt đầu bằng lượt user."""
+    entries = [e for e in channel_log.get(channel_id, []) if e.get("mid") is None or e.get("mid") != exclude_mid]
+    entries = entries[-MAX_CHANNEL_LOG:]
+
+    turns = []
+    for e in entries:
+        role = "model" if e["kind"] == "model" else "user"
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["text"] += "\n" + e["text"]
+        else:
+            turns.append({"role": role, "text": e["text"]})
+
+    while turns and turns[0]["role"] != "user":
+        turns.pop(0)
+
+    return [{"role": t["role"], "parts": [{"text": t["text"]}]} for t in turns]
 
 
-def reset_memory(channel_id, user_id):
-    chat_memory.pop(get_history_key(channel_id, user_id), None)
+def get_participants(channel_id):
+    """Trả về dict {tên hiển thị: user_id} của những người đang nói trong cảnh gần đây."""
+    now = time.time()
+    people = {}
+    for e in channel_log.get(channel_id, []):
+        if e["kind"] != "user" or not e.get("uid"):
+            continue
+        if now - e["ts"] > PARTICIPANT_WINDOW:
+            continue
+        people[e["name"]] = e["uid"]   # tên mới nhất ghi đè
+    return people
+
+
+mentioned_people = {}  # channel_id -> {tên: (uid, ts)}
+
+
+def register_participant(channel_id, uid, name):
+    """Ghi nhận người chỉ được nhắc tên (@mention) nhưng chưa nói gì, để Reimu có thể @ lại họ."""
+    if not uid or not name:
+        return
+    mentioned_people.setdefault(channel_id, {})[name] = (uid, time.time())
+
+
+def get_all_known_people(channel_id):
+    people = dict(get_participants(channel_id))
+    now = time.time()
+    for name, (uid, ts) in list(mentioned_people.get(channel_id, {}).items()):
+        if now - ts > PARTICIPANT_WINDOW:
+            mentioned_people[channel_id].pop(name, None)
+            continue
+        people.setdefault(name, uid)
+    return people
+
+
+def reset_memory(channel_id):
+    channel_log.pop(channel_id, None)
+    channel_last_active.pop(channel_id, None)
+    mentioned_people.pop(channel_id, None)
+
+
+def apply_mentions(text, channel_id):
+    """Đổi '@TênHiểnThị' trong câu trả lời của Reimu thành mention thật để người đó nhận thông báo."""
+    # Chặn ping hàng loạt
+    text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+    people = {n: u for n, u in get_all_known_people(channel_id).items() if n and len(n) >= 2}
+    if not people:
+        return text
+
+    names_sorted = sorted(people, key=len, reverse=True)
+    pattern = re.compile(r"@(" + "|".join(re.escape(n) for n in names_sorted) + r")(?!\w)", re.IGNORECASE)
+    lower_map = {n.lower(): u for n, u in people.items()}
+    used = set()
+
+    def _sub(m):
+        uid = lower_map.get(m.group(1).lower())
+        if uid is None:
+            return m.group(0)
+        if uid not in used and len(used) >= MAX_MENTIONS_PER_REPLY:
+            return m.group(0)
+        used.add(uid)
+        return f"<@{uid}>"
+
+    return pattern.sub(_sub, text)
 
 
 # ==============================================================================
@@ -84,7 +192,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Hakurei Reimu AI Chatbot (Master Roleplay Edition) is online!")
+        self.wfile.write(b"Hakurei Reimu AI Chatbot (Multi-Player Roleplay Edition) is online!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -247,6 +355,8 @@ def _extract_text(resp):
 
 async def ask_gemini(contents, system_instruction, temperature=0.85):
     """Trả về (text, ok). ok=False nghĩa là text là thông báo lỗi có sẵn (không lưu vào lịch sử)."""
+    global _models_checked_at
+
     if not GEMINI_CLIENTS:
         print("❌ ask_gemini: chưa có GEMINI_API_KEY", flush=True)
         return MSG_QUOTA, False
@@ -301,7 +411,6 @@ async def ask_gemini(contents, system_instruction, temperature=0.85):
                         if kind == "missing":
                             # Model không tồn tại -> bỏ qua 6 tiếng và ép dò lại danh sách
                             cooldown_tracker[tracker_key] = time.time() + 6 * 3600
-                            global _models_checked_at
                             _models_checked_at = 0.0
                             print(f"⚠️ [MODEL 404] {model_name} không tồn tại, bỏ qua.", flush=True)
                             break
@@ -322,7 +431,7 @@ async def ask_gemini(contents, system_instruction, temperature=0.85):
 
 
 # ==============================================================================
-# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (GIỮ NGUYÊN)
+# 4. SYSTEM PROMPT REIMU TỐI ƯU ROLEPLAY (GIỮ NGUYÊN + THÊM PHẦN ĐA NGƯỜI CHƠI)
 # ==============================================================================
 REIMU_SYSTEM_PROMPT = """
 Bạn là Hakurei Reimu (Bác Lệ Linh Mộng - 博麗 霊夢), Vu nữ tối cao của đền Hakurei, người gánh vác trọng trách duy trì Đại Kết Giới và giải quyết các Sự Biến ở Ảo Tưởng Hương (Gensokyo) trong Touhou Project.
@@ -375,6 +484,15 @@ Reimu: *Reimu ngồi bệt trên hành lang gỗ, một tay nâng chén trà ngh
 
 Khách: "[role play] *Một bầy yêu quái bóng tối tràn vào cổng Torii đền Hakurei, tôi rút kiếm chắn trước cửa đền.* Reimu, chuẩn bị chiến đấu!"
 Reimu: *Reimu bật dậy trong chớp mắt, dải ruy băng đỏ và vạt áo vu nữ tung bay trong gió lốc. Cây ngự trượng Gohei trong tay nàng vung lên phát ra những tia linh lực sáng lóa.* "Cả gan thật đấy! Đám yêu quái tép riu các ngươi dám kéo đến làm loạn nơi thanh tịnh của đền Hakurei à?! *Reimu liếc nhìn người bên cạnh rồi nhếch mép cười sắc lạnh.* Đứng né sang một bên đi kẻo bùa của ta thổi bay cả ngươi đấy! Spell Card: Linh Phù «Mộng Tưởng Phong Ấn»!"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. CHẾ ĐỘ NHIỀU NGƯỜI CHƠI CÙNG MỘT KÊNH (MULTI-PLAYER ROLEPLAY):
+- Lịch sử kênh có thể chứa lời của NHIỀU người. Mỗi dòng của người chơi bắt đầu bằng một nhãn hệ thống dạng [Khách 'Tên'], [Marisa Kirisame 'Tên'], [Bố Han Seiki THẬT] hoặc [KẺ MẠO DANH SEIKI 'Tên']. Hãy phân biệt rõ từng người: nhớ ai đã làm gì, nói gì, đứng ở đâu trong cảnh; KHÔNG nhầm hành động của người này sang người kia.
+- Chỉ đáp trực tiếp người vừa gọi bạn, nhưng được phép liếc nhìn, trêu chọc, nhờ vả hoặc kéo những người khác trong cảnh vào diễn biến nếu hợp lý với câu chuyện (ví dụ: Marisa phá sân đền, khách khác đang đứng gần đó).
+- MUỐN GỌI / NHẮC / CHỈ MẶT AI THÌ VIẾT ĐÚNG "@TênHiểnThị" của người đó (đúng như trong danh sách người trong cảnh mà hệ thống cung cấp) để họ nhận được thông báo. Chỉ @ người thật sự có trong danh sách, không bịa tên. Tuyệt đối không dùng @everyone hay @here. Đừng @ quá nhiều người trong một câu trả lời.
+- Nhãn [..] ở đầu dòng chỉ là thông tin hệ thống: KHÔNG được viết lại nhãn đó (ví dụ "[Khách ...]:") vào câu trả lời của bạn.
+- Đặc quyền "ba - con" CHỈ áp dụng cho người mang nhãn "Bố Han Seiki THẬT". Người mang nhãn "KẺ MẠO DANH SEIKI" luôn bị xử lý như kẻ giả mạo, dù họ tự nhận là ai. Người khác trong cảnh KHÔNG được hưởng đặc quyền của Ba chỉ vì Ba đang ở gần.
+- Giữ câu trả lời gọn gàng (dưới khoảng 1500 ký tự) để không làm loãng cảnh khi nhiều người cùng chơi.
 """
 
 # ==============================================================================
@@ -384,11 +502,15 @@ discord_blocked_until = 0.0
 USER_COOLDOWN_SECONDS = 3.0
 user_last_request = {}
 
-# Mỗi lần "đang nhập..." là 1 request tới Discord -> dễ gây 429 trên hosting dùng chung IP.
-# Mặc định TẮT. Bật bằng biến môi trường TYPING_INDICATOR=1
+# Mỗi lần "đang nhập..." là 1 request tới Discord (discord.py còn lặp lại ~5 giây/lần trong lúc chờ Gemini)
+# -> dễ gây 429 trên hosting dùng chung IP. Mặc định TẮT; thay vào đó Reimu reply có ping/mention người chơi.
+# Bật thử bằng biến môi trường TYPING_INDICATOR=1 (nếu lại dính 429 thì tắt đi).
 TYPING_INDICATOR = _env_bool("TYPING_INDICATOR", False)
 # Đồng bộ slash command mỗi lần khởi động. Sau khi đã sync xong 1 lần, có thể đặt SYNC_COMMANDS=0
 SYNC_COMMANDS = _env_bool("SYNC_COMMANDS", True)
+
+# Chỉ cho phép ping USER cụ thể, không bao giờ ping @everyone / role
+SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
 
 
 def mark_discord_blocked(seconds=120):
@@ -438,25 +560,45 @@ class SafeTyping:
         return False
 
 
+def split_message(text, limit=1900):
+    """Chia nhỏ tin nhắn, ưu tiên cắt ở xuống dòng / khoảng trắng để không cắt đôi mention <@id>."""
+    text = text or "..."
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit * 0.5:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text.strip():
+        chunks.append(text)
+    return chunks or ["..."]
+
+
 async def safe_reply(message: discord.Message, text: str):
-    """Gửi trả lời an toàn: tự chia nhỏ, tự fallback sang channel.send, không văng lỗi."""
+    """Gửi trả lời an toàn: reply có ping người gọi, tự chia nhỏ, tự fallback sang channel.send, không văng lỗi."""
     if is_discord_blocked():
         print("⏸️ [BỎ QUA] Đang bị Discord chặn tạm thời, không gửi tin.", flush=True)
         return
 
-    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or ["..."]
+    chunks = split_message(text)
     for idx, chunk in enumerate(chunks):
         try:
             if idx == 0:
-                await message.reply(chunk, mention_author=False)
+                # mention_author=True -> người gọi Reimu nhận thông báo (thay cho dòng "đang nhập...")
+                await message.reply(chunk, mention_author=True, allowed_mentions=SAFE_MENTIONS)
             else:
-                await message.channel.send(chunk)
+                await message.channel.send(chunk, allowed_mentions=SAFE_MENTIONS)
         except discord.HTTPException as e:
             handle_discord_http_error(e)
             if e.status == 429:
                 return
             try:
-                await message.channel.send(chunk)
+                # Tin gốc có thể đã bị xoá -> gửi thường nhưng vẫn tag người gọi
+                prefix = f"<@{message.author.id}> " if idx == 0 else ""
+                await message.channel.send(prefix + chunk, allowed_mentions=SAFE_MENTIONS)
             except Exception as e2:
                 print(f"❌ [GỬI TIN THẤT BẠI] {e2}", flush=True)
                 return
@@ -475,11 +617,28 @@ MAX_LOGIN_BACKOFF = 1800      # 30 phút
 login_backoff = INITIAL_LOGIN_BACKOFF
 
 
+def speaker_label(author, display_name):
+    """Nhãn nhận diện người nói, gắn vào nhật ký kênh để Gemini phân biệt nhiều người chơi."""
+    name_l = (display_name or "").lower()
+    if author.id == AUTHORIZED_ADMIN_ID:
+        return "Bố Han Seiki THẬT"
+    if "seiki" in name_l:
+        return f"KẺ MẠO DANH SEIKI '{display_name}'"
+    if "marisa" in name_l or "marisa" in (author.name or "").lower():
+        return f"Marisa Kirisame '{display_name}'"
+    return f"Khách '{display_name}'"
+
+
 class ReimuBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix="?reimu ", intents=intents, help_command=None)
+        super().__init__(
+            command_prefix="?reimu ",
+            intents=intents,
+            help_command=None,
+            allowed_mentions=SAFE_MENTIONS,
+        )
         self._synced = False
 
     async def setup_hook(self):
@@ -515,12 +674,29 @@ class ReimuBot(commands.Bot):
                 except Exception:
                     pass
 
-        @self.tree.command(name="clearmem", description="Xóa ký ức cuộc trò chuyện hiện tại với Reimu")
+        @self.tree.command(name="clearmem", description="Xóa ký ức cảnh roleplay của cả kênh này (cần quyền Quản lý tin nhắn)")
         async def slash_clear_memory(interaction: discord.Interaction):
-            reset_memory(interaction.channel_id, interaction.user.id)
+            perms = getattr(interaction.user, "guild_permissions", None)
+            allowed = (
+                interaction.user.id == AUTHORIZED_ADMIN_ID
+                or (perms is not None and (perms.manage_messages or perms.administrator))
+                or interaction.guild is None   # trong DM thì ai cũng xóa được ký ức của chính mình
+            )
+            if not allowed:
+                try:
+                    await interaction.response.send_message(
+                        "⛩️ *Reimu nheo mắt.* \"Cảnh này có nhiều người đang chơi chung, ngươi đâu có quyền quét sạch! "
+                        "Nhờ người quản lý kênh đi!\"",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException as e:
+                    handle_discord_http_error(e)
+                return
+
+            reset_memory(interaction.channel_id)
             embed = discord.Embed(
                 title="🧹 Tẩy Não",
-                description="*Reimu quét sạch lá rụng và ký ức hội thoại cũ trên hiên đền!*",
+                description="*Reimu quét sạch lá rụng và ký ức của cả cảnh roleplay trong kênh này trên hiên đền!*",
                 color=0x10B981,
             )
             try:
@@ -544,7 +720,7 @@ class ReimuBot(commands.Bot):
         print("==================================================", flush=True)
         print(f"✅ [CHATBOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
         print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
-        print("⛩️ Hakurei Reimu Master Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
+        print("⛩️ Hakurei Reimu Multi-Player Roleplay Chatbot sẵn sàng phục vụ!", flush=True)
         print("==================================================", flush=True)
         # Dò model sớm để log ra danh sách đang dùng
         if GEMINI_CLIENTS:
@@ -562,15 +738,29 @@ class ReimuBot(commands.Bot):
         except Exception as e:
             print(f"❌ [LỖI on_message]: {type(e).__name__}: {e}", flush=True)
 
+    def render_content(self, message: discord.Message):
+        """Biến nội dung tin nhắn thành text dễ đọc cho Gemini:
+        - bỏ mention của bot
+        - đổi <@id> của người khác thành @TênHiểnThị (và ghi nhận họ là người trong cảnh để Reimu @ lại được)"""
+        content = message.content or ""
+        for m in message.mentions:
+            tag_variants = (f"<@{m.id}>", f"<@!{m.id}>")
+            if self.user is not None and m.id == self.user.id:
+                for t in tag_variants:
+                    content = content.replace(t, "")
+            else:
+                name = m.display_name
+                for t in tag_variants:
+                    content = content.replace(t, f"@{name}")
+                if not m.bot:
+                    register_participant(message.channel.id, m.id, name)
+        return content.strip()
+
     async def handle_reimu_message(self, message: discord.Message):
         if message.author.bot:
             return
 
         if message.content.startswith("!") or message.content.startswith("/"):
-            return
-
-        # Đang bị Discord chặn -> bỏ qua (cũng tiết kiệm luôn quota Gemini)
-        if is_discord_blocked():
             return
 
         content_lower = message.content.lower()
@@ -583,8 +773,25 @@ class ReimuBot(commands.Bot):
         bot_names = ["reimu", "hakurei", "linh mộng", "bác lệ", "bác lệ linh mộng"]
         name_called = any(name in content_lower for name in bot_names)
         is_rp_tagged = bool(re.search(r"\[role\s*play\]|\[rp\]", content_lower))
+        triggered = is_mentioned or name_called or is_rp_tagged
 
-        if not (is_mentioned or name_called or is_rp_tagged):
+        channel_id = message.channel.id
+        user_display_name = message.author.display_name
+        user_account_name = message.author.name
+        clean_content = self.render_content(message)
+        label = speaker_label(message.author, user_display_name)
+
+        # ---------------- TIN KHÔNG GỌI REIMU: CHỈ "NGHE" NẾU PHIÊN RP ĐANG MỞ ----------------
+        # Không gọi Gemini, không gọi Discord API -> không tốn quota, không tăng nguy cơ 429.
+        if not triggered:
+            last = channel_last_active.get(channel_id, 0)
+            if clean_content and (time.time() - last) < RP_SESSION_TIMEOUT:
+                add_log_entry(channel_id, "user", message.author.id, user_display_name,
+                              f"[{label}]: {clean_content}", mid=message.id)
+            return
+
+        # Đang bị Discord chặn -> bỏ qua (cũng tiết kiệm luôn quota Gemini)
+        if is_discord_blocked():
             return
 
         now = time.time()
@@ -595,23 +802,19 @@ class ReimuBot(commands.Bot):
             for k in list(user_last_request)[:1000]:
                 user_last_request.pop(k, None)
 
-        clean_content = message.content
-        if self.user:
-            clean_content = (
-                clean_content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
-            )
-
         if not clean_content:
             clean_content = "*Reimu liếc mắt nhìn ngươi một cái rồi ngáp dài.* Ngươi gọi ta có chuyện gì? Mau bỏ tiền vào hòm công đức rồi nói!"
 
-        user_display_name = message.author.display_name
-        user_account_name = message.author.name
+        # Mở / gia hạn phiên RP của kênh
+        channel_last_active[channel_id] = now
+
+        # Ghi tin này vào nhật ký chung NGAY (để các người chơi khác gọi Reimu cùng lúc vẫn thấy thứ tự đúng)
+        add_log_entry(channel_id, "user", message.author.id, user_display_name,
+                      f"[{label}]: {clean_content}", mid=message.id)
 
         is_father = message.author.id == AUTHORIZED_ADMIN_ID
         is_fake_seiki = (not is_father) and ("seiki" in user_display_name.lower())
         is_marisa = ("marisa" in user_display_name.lower()) or ("marisa" in user_account_name.lower())
-
-        history = get_conversation_history(message.channel.id, message.author.id)
 
         if is_father:
             identity_context = (
@@ -641,28 +844,41 @@ class ReimuBot(commands.Bot):
                 "trong cặp dấu hoa thị *hành động*, giữ trọn phong thái Vu nữ mạnh mẽ, đanh đá và kiên cường của Reimu!]"
             )
 
-        prompt_with_context = f"{identity_context}\n{user_display_name} nói: {clean_content}"
+        # Danh sách người đang trong cảnh -> để Reimu biết @ ai
+        async with get_channel_lock(channel_id):
+            people = get_all_known_people(channel_id)
+            others = [n for n, u in people.items() if u != message.author.id]
+            if others:
+                identity_context += (
+                    "\n[ĐA NGƯỜI CHƠI: Trong cảnh còn có: "
+                    + ", ".join(f"@{n}" for n in others[:8])
+                    + f". Người vừa gọi bạn là @{user_display_name}. Bạn đang đáp lại NGƯỜI VỪA GỌI, nhưng có thể "
+                    "nhắc/trêu/kéo người khác vào cảnh bằng cách viết đúng @TênHiểnThị để họ nhận thông báo.]"
+                )
 
-        contents = []
-        for h in history:
-            r = h.get("role", "user")
-            t = h.get("text", "")
-            if t:
-                contents.append({"role": r, "parts": [{"text": t}]})
-        contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
+            prompt_with_context = f"{identity_context}\n[{label}]: {clean_content}"
 
-        async with SafeTyping(message.channel):
-            try:
-                reply_text, ok = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
-            except Exception as e:
-                print(f"❌ [LỖI GEMINI CHAT]: {type(e).__name__}: {str(e)[:300]}", flush=True)
-                reply_text, ok = MSG_QUOTA, False
+            # Lịch sử CHUNG của kênh (nhiều người), không tính tin hiện tại vì đã nằm ở lượt cuối
+            contents = build_history_contents(channel_id, exclude_mid=message.id)
+            if contents and contents[-1]["role"] == "user":
+                # Gemini chấp nhận nhưng gộp cho gọn, tránh 2 lượt user liên tiếp
+                contents[-1]["parts"][0]["text"] += "\n" + prompt_with_context
+            else:
+                contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
 
-        if ok:
-            role_tag = "Bố Han Seiki" if is_father else f"Người dùng {user_display_name}"
-            history.append({"role": "user", "text": f"[{role_tag}]: {clean_content}"})
-            history.append({"role": "model", "text": reply_text})
-            save_conversation_history(message.channel.id, message.author.id, history)
+            async with SafeTyping(message.channel):
+                try:
+                    reply_text, ok = await ask_gemini(contents, REIMU_SYSTEM_PROMPT, temperature=0.85)
+                except Exception as e:
+                    print(f"❌ [LỖI GEMINI CHAT]: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                    reply_text, ok = MSG_QUOTA, False
+
+            if ok:
+                # Lưu bản gốc (chưa đổi sang <@id>) vào ký ức
+                add_log_entry(channel_id, "model", 0, "Reimu", reply_text)
+                channel_last_active[channel_id] = time.time()
+                # Đổi @Tên -> mention thật để người được nhắc nhận thông báo
+                reply_text = apply_mentions(reply_text, channel_id)
 
         await safe_reply(message, reply_text)
 
