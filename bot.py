@@ -54,6 +54,15 @@ def _env_bool(name, default=False):
 # ==============================================================================
 AUTHORIZED_ADMIN_ID = 1502579398560317441
 
+# ---- KẺ PHẢN BỘI: Reimu khinh miệt, không nghe bất kỳ lệnh/bối cảnh nào ----
+TRAITOR_IDS = {1229799511681929226}
+TRAITOR_REPLY_CHANCE = _env_float("TRAITOR_REPLY_CHANCE", 0.25)   # xác suất Reimu buông câu (0.25 = 25%)
+TRAITOR_REPLIES = [
+    "kẻ phản bội không đáng để ta nói chuyện",
+    "*Reimu thậm chí không ngoảnh đầu lại.* \"Kẻ phản bội không đáng để ta nói chuyện.\"",
+    "*Reimu nhấp ngụm trà, ánh mắt lạnh như băng lướt qua rồi quay đi.* \"Kẻ phản bội không đáng để ta nói chuyện.\"",
+]
+
 # Mỗi kênh có 1 "nhật ký cảnh" chung: mọi người chơi + Reimu cùng nằm trong đó.
 # channel_id -> list[{"kind": "user"|"model", "uid": int, "name": str, "text": str, "mid": int|None, "ts": float}]
 channel_log = {}
@@ -769,6 +778,25 @@ class ReimuBot(commands.Bot):
 
         # Chốt chặn phụ: tuyệt đối không xử lý DM
         if message.guild is None:
+            return
+        # ---- KẺ PHẢN BỘI: bỏ qua hoàn toàn, không lưu nhật ký, không gọi Gemini ----
+        if message.author.id in TRAITOR_IDS:
+            content_lower_t = (message.content or "").lower()
+            ref_t = message.reference.resolved if message.reference else None
+            called_t = (
+                (self.user in message.mentions)
+                or (ref_t is not None and getattr(ref_t, "author", None) == self.user)
+                or any(n in content_lower_t for n in ("reimu", "hakurei", "linh mộng", "bác lệ"))
+                or bool(RP_ANY_RE.search(content_lower_t))
+            )
+            if (
+                called_t
+                and not is_discord_blocked()
+                and random.random() < TRAITOR_REPLY_CHANCE
+                and time.time() - user_last_request.get(message.author.id, 0) >= USER_COOLDOWN_SECONDS * 5
+            ):
+                user_last_request[message.author.id] = time.time()
+                await safe_reply(message, random.choice(TRAITOR_REPLIES))
             return
 
         if message.content.startswith("!") or message.content.startswith("/"):
