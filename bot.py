@@ -1,13 +1,13 @@
 # ==============================================================================
-# HAKUREI REIMU CHATBOT EDITION v2.4 - ENHANCED ROLEPLAY (NO-MENTION EDITION)
-# - Giữ nguyên toàn bộ cơ chế v2.2/v2.3 (tự dò model, xoay key, retry, chống 429)
+# HAKUREI REIMU CHATBOT EDITION v2.5 - ENHANCED ROLEPLAY (NO-MENTION + NO-DM EDITION)
+# - Giữ nguyên toàn bộ cơ chế v2.2/v2.3/v2.4 (tự dò model, xoay key, retry, chống 429)
 # - Giữ nguyên bộ nhớ theo KÊNH (nhiều người chơi chung 1 cảnh, phân biệt từng người)
-# - GỠ BỎ tính năng mention/ping: reply không ping (mention_author=False),
-#   AllowedMentions.none(), bot không @ hay ping bất kỳ ai trong câu trả lời
-# - NÂNG CẤP ROLEPLAY: Nhận diện [roleplay] / [rp] ở đầu câu (hoặc trong câu) là
-#   câu chuyện ảo -> làm theo bối cảnh/kịch bản của người chơi, tự giữ phiên RP
-#   theo kênh, và khi câu chuyện yêu cầu Reimu tham gia thì đa phần giữ đúng
-#   tính cách bản nguyên của Reimu
+# - Giữ nguyên chế độ [roleplay] / [rp] và không mention/ping ai
+# - MỚI v2.5: KHOÁ HOÀN TOÀN CHAT RIÊNG (DM):
+#     + Tắt intent nhận tin DM ngay từ Gateway (bot không nhận sự kiện DM nào)
+#     + on_message bỏ qua mọi tin không nằm trong server (message.guild is None)
+#     + Các slash command (/wiki, /endrp, /clearmem) chỉ dùng được trong server
+#     => Không tốn token Gemini cho DM, giảm tải server chat, hạn chế 429
 # - Typing: vẫn TẮT mặc định để tránh 429/ban IP trên hosting dùng chung
 # ==============================================================================
 import os
@@ -220,6 +220,7 @@ MODEL_REFRESH_SECONDS = 6 * 3600
 MSG_QUOTA = "⛩️ *Reimu ngáp dài buông chén trà.* Hòm công đức đông khách quá làm bùa chú nghẽn mạch rồi! Mau cúng tiền rồi lát nữa quay lại!"
 MSG_SAFETY = "⛩️ *Reimu nhíu mày, vung gohei gạt phăng câu đó đi.* \"Câu này ta không thèm đáp! Đổi chủ đề đi, đồ rảnh rỗi!\""
 MSG_EMPTY = "⛩️ *Reimu chớp mắt ngơ ngác.* \"Ta lỡ thần người mất rồi... Nói lại xem nào!\""
+MSG_NO_DM = "⛩️ *Reimu khép cửa đền.* \"Muốn nói chuyện thì ra hiên đền (server) mà nói, ta không tiếp khách trong phòng riêng đâu!\""
 
 cooldown_tracker = {}          # (key_idx, model) -> thời điểm hết cooldown
 _available_models = set()      # model thực sự có trên API (dò tự động)
@@ -601,6 +602,10 @@ class ReimuBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        # ---- KHOÁ DM: không nhận bất kỳ sự kiện nào từ chat riêng ----
+        intents.dm_messages = False
+        intents.dm_reactions = False
+        intents.dm_typing = False
         super().__init__(
             command_prefix="?reimu ",
             intents=intents,
@@ -611,8 +616,16 @@ class ReimuBot(commands.Bot):
 
     async def setup_hook(self):
         @self.tree.command(name="wiki", description="Tra cứu nhân vật Touhou cùng lời bình của Reimu")
+        @app_commands.guild_only()
         @app_commands.describe(nhan_vat="Tên nhân vật Touhou")
         async def touhou_wiki(interaction: discord.Interaction, nhan_vat: str):
+            # Chốt chặn phụ: không phục vụ ngoài server (DM / nhóm chat riêng)
+            if interaction.guild is None:
+                try:
+                    await interaction.response.send_message(MSG_NO_DM, ephemeral=True)
+                except discord.HTTPException as e:
+                    handle_discord_http_error(e)
+                return
             try:
                 await interaction.response.defer()
             except discord.HTTPException as e:
@@ -643,7 +656,14 @@ class ReimuBot(commands.Bot):
                     pass
 
         @self.tree.command(name="endrp", description="Thoát chế độ câu chuyện ảo [roleplay] trong kênh này")
+        @app_commands.guild_only()
         async def slash_end_rp(interaction: discord.Interaction):
+            if interaction.guild is None:
+                try:
+                    await interaction.response.send_message(MSG_NO_DM, ephemeral=True)
+                except discord.HTTPException as e:
+                    handle_discord_http_error(e)
+                return
             channel_rp_active.pop(interaction.channel_id, None)
             embed = discord.Embed(
                 title="📖 Đóng Màn Roleplay",
@@ -656,12 +676,19 @@ class ReimuBot(commands.Bot):
                 handle_discord_http_error(e)
 
         @self.tree.command(name="clearmem", description="Xóa ký ức cảnh roleplay của cả kênh này (cần quyền Quản lý tin nhắn)")
+        @app_commands.guild_only()
         async def slash_clear_memory(interaction: discord.Interaction):
+            if interaction.guild is None:
+                try:
+                    await interaction.response.send_message(MSG_NO_DM, ephemeral=True)
+                except discord.HTTPException as e:
+                    handle_discord_http_error(e)
+                return
+
             perms = getattr(interaction.user, "guild_permissions", None)
             allowed = (
                 interaction.user.id == AUTHORIZED_ADMIN_ID
                 or (perms is not None and (perms.manage_messages or perms.administrator))
-                or interaction.guild is None
             )
             if not allowed:
                 try:
@@ -701,7 +728,8 @@ class ReimuBot(commands.Bot):
         print("==================================================", flush=True)
         print(f"✅ [CHATBOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
         print(f"🔑 Số lượng API Key đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
-        print("⛩️ Hakurei Reimu Enhanced Roleplay Chatbot (No-Mention) sẵn sàng phục vụ!", flush=True)
+        print("🔒 Chat riêng (DM) đã bị KHOÁ - bot chỉ phục vụ trong server.", flush=True)
+        print("⛩️ Hakurei Reimu Enhanced Roleplay Chatbot (No-Mention, No-DM) sẵn sàng phục vụ!", flush=True)
         print("==================================================", flush=True)
         if GEMINI_CLIENTS:
             await get_active_models()
@@ -711,6 +739,9 @@ class ReimuBot(commands.Bot):
         print(f"❌ [LỖI SỰ KIỆN {event_method}]\n{traceback.format_exc()}", flush=True)
 
     async def on_message(self, message: discord.Message):
+        # ---- KHOÁ DM: bỏ qua mọi tin nhắn không nằm trong server (không tốn token, không phản hồi) ----
+        if message.guild is None:
+            return
         try:
             await self.handle_reimu_message(message)
         except discord.HTTPException as e:
@@ -734,6 +765,10 @@ class ReimuBot(commands.Bot):
 
     async def handle_reimu_message(self, message: discord.Message):
         if message.author.bot:
+            return
+
+        # Chốt chặn phụ: tuyệt đối không xử lý DM
+        if message.guild is None:
             return
 
         if message.content.startswith("!") or message.content.startswith("/"):
