@@ -214,7 +214,7 @@ GEMINI_CLIENTS = [genai.Client(api_key=k) for k in GEMINI_API_KEYS]
 # Danh sách ưu tiên (có thể ghi đè bằng biến môi trường GEMINI_MODELS="a,b,c").
 # Model nào KHÔNG tồn tại trên API sẽ tự bị loại nhờ bước dò model bên dưới.
 _DEFAULT_MODELS = (
-    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,"
+    "gemini-4-hydrogen,gemini-3.8-flash,gemini-3.6-flash,"
     "gemini-3.5-flash-lite,gemini-3.1-flash-lite,"
     "gemini-flash-latest,gemini-flash-lite-latest"
 )
